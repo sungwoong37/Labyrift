@@ -1,0 +1,23 @@
+# === 화이트리스트: 아래 항목만 추적, 나머지 루트 항목은 전부 무시 ===
+/*
+!/.gitignore
+!/.gitattributes
+!/Content/
+!/Config/
+!/Source/
+!/Plugins/
+!/*.uproject
+
+# === UE 생성물(명시적으로도 무시) ===
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+
+# === 대용량 원본 소스 텍스처(런타임 불필요, .uasset만 사용) ===
+Content/**/*.tga
+
+# OS
+Thumbs.db
+.DS_Store

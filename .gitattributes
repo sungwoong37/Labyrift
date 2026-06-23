@@ -1,0 +1,21 @@
+# 텍스트 파일은 자동 정규화, 언리얼 바이너리 에셋은 바이너리로 취급(병합·CRLF 변환 방지)
+* text=auto
+
+*.uasset binary
+*.umap binary
+*.upk binary
+*.udk binary
+*.uplugin text
+*.uproject text
+*.ini text
+*.cpp text
+*.h text
+*.cs text
+
+# 원본 미디어(바이너리)
+*.tga binary
+*.png binary
+*.jpg binary
+*.fbx binary
+*.wav binary
+*.ttf binary
