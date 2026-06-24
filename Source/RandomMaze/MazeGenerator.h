@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Engine/TimerHandle.h"
+#include "Math/RandomStream.h"
 #include "Templates/SubclassOf.h"
 #include "MazeGenerator.generated.h"
 
@@ -111,20 +112,21 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "0.0"))
 	float OpenAheadDistance = 1000.f;
 
-	/** 벽 하나가 옆으로 미끄러져 완전히 열리는 데 걸리는 시간(초). 클수록 천천히. */
+	/** 벽 하나가 미끄러져 완전히 열리는 데 걸리는 시간(초). 클수록 천천히. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "0.05"))
 	float WallSlideDuration = 0.9f;
 
-	/** 미끼(막다른) 분기 개수. 시작부터 여러 갈래로 보이게. 탈출 길은 항상 하나(메인). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "0"))
-	int32 DecoyBranchCount = 5;
+	/** 슬라이드 개방 시 도는 수직축(yaw) 회전량(도). 0이면 회전 없음. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale")
+	float WallOpenSpinDegrees = 120.f;
 
-	/** 미끼 분기 최소/최대 길이(셀). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "1"))
-	int32 DecoyBranchLenMin = 2;
+	/** 문(여닫이) 방식 회전 각도(도). 90이면 인접 슬롯에 플러시로 활짝 열려 통로를 막지 않는다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale")
+	float WallSwingDegrees = 90.f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "1"))
-	int32 DecoyBranchLenMax = 5;
+	/** 플레이어가 경로 셀에 이 거리(cm) 안으로 다가오면, 그 셀의 '길이 아닌' 옆 통로에 벽이 새로 생겨 닫힌다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "0.0"))
+	float CloseAheadDistance = 700.f;
 
 	/** 탈출 출구로 스폰할 액터 클래스(비우면 AMazeExit 기본). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale")
@@ -219,25 +221,45 @@ private:
 	/** 플레이어 폰 위치를 액터 로컬좌표 → 클램프된 셀(FIntPoint)로 변환. 폰 없으면 액터 위치 기준. */
 	FIntPoint GetPlayerCell() const;
 
-	// --- 피날레: 벽이 미끄러지며 출구까지 길을 여는 연출 ---
+	// --- 피날레: 벽을 열고(치우고) 닫으며(생성) 출구까지 길을 만드는 연출 ---
 
-	/** 진행 중인 한 벽 슬라이드 애니메이션. */
-	struct FWallSlide
+	/** 벽 개폐 애니메이션 방식. 여러 방식을 섞어 다채롭게 길을 만든다. */
+	enum class EWallAnimStyle : uint8
 	{
-		int32 InstanceIndex = INDEX_NONE;
-		FTransform StartXform;   // 시작 트랜스폼(로컬).
-		FVector SlideOffset = FVector::ZeroVector; // 완전히 열렸을 때의 이동량.
-		float Elapsed = 0.f;
-		FIntPoint CellA = FIntPoint::ZeroValue;    // 이 벽이 분리하던 두 셀(완료 시 비트 클리어).
-		FIntPoint CellB = FIntPoint::ZeroValue;
+		Slide,     // 옆으로 미끄러짐(+약간 회전).
+		SwingDoor, // 한쪽 끝을 축으로 문처럼 여닫힘.
+		RiseFall,  // 바닥에서 솟거나 바닥으로 가라앉음(닫기 전용 사용).
 	};
 
-	/** 코너 단위로 한 번에 열리는 직선 구간(메인/분기 공통). */
+	/** 진행 중인 한 벽 개폐 애니메이션(열기=치움, 닫기=생성). */
+	struct FWallAnim
+	{
+		int32 InstanceIndex = INDEX_NONE;
+		EWallAnimStyle Style = EWallAnimStyle::Slide;
+		bool bOpening = true;     // true=열림(있다가 사라짐), false=닫힘(없다가 생김).
+		float Elapsed = 0.f;
+		FIntPoint CellA = FIntPoint::ZeroValue; // 이 벽이 가르는 두 셀(완료 시 비트 갱신).
+		FIntPoint CellB = FIntPoint::ZeroValue;
+		// 기하(제자리=닫힘 상태 기준).
+		FQuat BaseRot = FQuat::Identity;
+		FVector Scale = FVector::OneVector;
+		FVector Center = FVector::ZeroVector;       // 제자리일 때 바운드 중심(액터 로컬).
+		FVector BoundsOffset = FVector::ZeroVector; // 스케일된 피벗 보정.
+		FVector SlideDir = FVector::ForwardVector;  // 슬라이드 방향(벽 길이축).
+		FVector PivotOffset = FVector::ZeroVector;  // 문 경첩축 = Center + PivotOffset.
+		float SwingSign = 1.f;                      // 문 회전 방향(+1/-1).
+		// 열기 완료 시 벽이 안착하는 인접 빈 슬롯(이 슬롯을 봉인 처리·이중 방지). 무효=(-1,-1).
+		FIntPoint RestSlotA = FIntPoint(-1, -1);
+		FIntPoint RestSlotB = FIntPoint(-1, -1);
+	};
+
+	/** 코너 단위로 한 번에 열리는 직선 구간(메인 경로). */
 	struct FRevealSegment
 	{
-		TArray<TPair<FIntPoint, FIntPoint>> Edges; // 이 구간에서 열 벽들(인접 셀 쌍).
+		TArray<TPair<FIntPoint, FIntPoint>> Edges;  // 이 구간에서 열 벽들(인접 셀 쌍).
 		FVector TriggerWorld = FVector::ZeroVector; // 구간 시작 셀 월드(플레이어가 근접하면 열림).
 		int32 Parent = INDEX_NONE;                  // 직전 구간(-1=루트). 부모가 열려야 열림.
+		EWallAnimStyle Style = EWallAnimStyle::Slide; // 이 구간 벽들의 개방 방식.
 		bool bOpened = false;
 	};
 
@@ -249,6 +271,40 @@ private:
 
 	/** 인접 두 셀 A,B 사이의 벽 비트를 양쪽에서 제거한다. */
 	void ClearWallBetween(FIntPoint A, FIntPoint B);
+
+	/** 인접 두 셀 A,B 사이에 벽 비트를 양쪽에서 추가한다(닫기). */
+	void SetWallBetween(FIntPoint A, FIntPoint B);
+
+	/** A,B 사이에 벽이 있는지(닫혀 있는지). 인접 아님/범위 밖은 true(막힘) 취급. */
+	bool IsWallClosed(FIntPoint A, FIntPoint B) const;
+
+	/** 인접 두 셀 A,B를 잇는 벽의 소유 셀/면(Side: 0=North, 1=East)을 구한다. 인접 아니면 false. */
+	bool EdgeOwner(FIntPoint A, FIntPoint B, int32& OutX, int32& OutY, int32& OutSide) const;
+
+	/** 인접 두 셀 A,B 사이 벽의 정규화 키(EncodeWallKey 기반). 인접 아니면 -1. */
+	int64 EdgeKey(FIntPoint A, FIntPoint B) const;
+
+	/** 벽 메시 스케일/피벗 보정(렌더와 동일 규칙, 한 곳에서 산출). */
+	void GetWallMeshScaling(FVector& OutScale, FVector& OutBoundsOffset) const;
+
+	/** (X,Y,Side) 벽의 기하(회전/스케일/중심/피벗보정). 렌더(EmplaceWall)와 동일 규칙. */
+	bool ComputeWallGeom(int32 X, int32 Y, int32 Side, FQuat& OutRot, FVector& OutScale, FVector& OutCenter, FVector& OutBoundsOffset) const;
+
+	/** 개방량 OpenAmount(0=제자리, 1=완전개방/사라짐)에 해당하는 인스턴스 트랜스폼. */
+	FTransform AnimXform(const FWallAnim& A, float OpenAmount) const;
+
+	/** 간선(A,B) 벽이 Desired 방식으로 열릴 때, 길을 막지 않게 안착할 '비경로 빈 인접 슬롯'을 찾는다.
+	 *  슬라이드/문 모두 불가하면 RiseFall(바닥으로 가라앉아 사라짐)로 폴백.
+	 *  Out: 슬라이드 방향/문 피벗/문 회전 부호/안착 슬롯(A,B). 폴백이면 안착 슬롯은 (-1,-1). */
+	EWallAnimStyle ResolveAnimStyle(FIntPoint A, FIntPoint B, EWallAnimStyle Desired,
+		FVector& OutSlideDir, FVector& OutPivotOffset, float& OutSwingSign,
+		FIntPoint& OutRestA, FIntPoint& OutRestB) const;
+
+	/** 경로 간선(A,B)의 벽을 '열기'로 예약(렌더된 인스턴스가 있을 때만). */
+	void ScheduleOpenEdge(FIntPoint A, FIntPoint B, EWallAnimStyle Style);
+
+	/** 경로 아닌 간선(A,B)에 벽을 '닫기'로 예약. 치운 벽(FreedWallPool) 재사용 + 바닥 아래에서 시작(팝 없음). */
+	void ScheduleCloseEdge(FIntPoint A, FIntPoint B, EWallAnimStyle Style);
 
 	/** 방(R) 내부 벽을 열어 공터로 만든다(피날레 폐쇄 후 목표 방 크기 유지용). */
 	void OpenRoomInterior(const FIntRect& R);
@@ -280,14 +336,36 @@ private:
 	/** (X,Y,Side) 키 → 렌더된 벽 인스턴스 인덱스(피날레 길찾기/애니용). */
 	TMap<int64, int32> WallInstanceIndex;
 
-	/** 열 구간들(메인 경로 + 미끼 분기). 부모-자식 트리 순서로 proximity 개방. */
+	/** 열 구간들(메인 경로). 부모-자식 순서로 proximity 개방. */
 	TArray<FRevealSegment> Segments;
 
-	/** 지금까지 열기 시작한 벽 총 개수(추격자 등장 트리거). */
+	/** 지금까지 열기 시작한 벽 총 개수(로그/디버그용). */
 	int32 OpenedWallCount = 0;
 
-	/** 진행 중인 슬라이드들. */
-	TArray<FWallSlide> ActiveSlides;
+	/** 진행 중인 벽 개폐 애니메이션들. */
+	TArray<FWallAnim> ActiveAnims;
+
+	/** 열기 완료로 풀린(바닥 아래 파킹) 벽 인스턴스 — 닫기에서 재배치 재사용. */
+	TArray<int32> FreedWallPool;
+
+	/** 메인 경로 셀들(닫기 트리거 검사용). */
+	TArray<FIntPoint> RouteCells;
+
+	/** 각 경로 셀의 옆 통로 닫기 처리 여부. */
+	TArray<bool> RouteCellClosed;
+
+	/** 메인 경로 간선 키 집합(이 벽들은 절대 닫지 않는다 → 길 보장). */
+	TSet<int64> RouteEdgeSet;
+
+	/** 이미 개폐 애니를 건 간선 키(중복 방지). */
+	TSet<int64> AnimatedEdges;
+
+	/** 피날레 연출용 난수(개폐 방식 선택). */
+	FRandomStream FinaleStream;
+
+	/** 목표 방(시작 공간) — 이 안의 셀은 옆 통로 닫기에서 제외. */
+	FIntRect FinaleGoalRoom = FIntRect();
+	bool bFinaleHasGoalRoom = false;
 
 	/** 스폰한 출구 액터(약참조). */
 	TWeakObjectPtr<AMazeExit> ExitActor;

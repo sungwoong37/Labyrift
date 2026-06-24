@@ -411,34 +411,9 @@ void AMazeGenerator::BuildWallsInWindow(FIntPoint Center, int32 Radius)
 	const float HalfCell = CellSize * 0.5f;
 	const float HalfHeight = WallHeight * 0.5f;
 
-	// 메시 바운드에서 실제 크기/피벗을 읽어 스케일한다(과거: 100u 큐브 하드코딩).
-	// 가정: 메시 로컬 X=길이, Y=두께, Z=높이. (엔진 큐브는 100³ 대칭이라 그대로 맞고,
-	//        진짜 벽 메시는 방향이 다르면 WallMeshYawOffset로 보정.)
-	const FBoxSphereBounds MeshBounds = WallStaticMesh->GetBounds();
-	const FVector MeshSize = MeshBounds.BoxExtent * 2.0; // 전체 크기 = 절반범위 ×2.
-	// 0 나눗셈/폭주 방지(납작한 메시 대비).
-	const double SizeX = FMath::Max<double>(MeshSize.X, UE_KINDA_SMALL_NUMBER);
-	const double SizeY = FMath::Max<double>(MeshSize.Y, UE_KINDA_SMALL_NUMBER);
-	const double SizeZ = FMath::Max<double>(MeshSize.Z, UE_KINDA_SMALL_NUMBER);
-
-	// 두께를 스케일로 강제하지 않는다: 수평(X·Y)을 같은 배율(HUniform)로 묶어 균일 스케일해
-	// 메시 단면(두께:길이) 비율을 그대로 유지 → 벽돌이 옆으로 찌그러지지 않는다.
-	// HUniform은 "셀 길이를 채우도록" 정하고, 실제 두께는 메시 비율에서 따라온다.
-	const double HUniform = CellSize / SizeX;
-	const double RenderedThickness = SizeY * HUniform; // 메시 비율에서 나온 실제 벽 두께.
-
-	// 모서리 메움 = 길이를 '겹침'만큼만 늘림. 겹침은 실제 두께를 넘지 않게 캡 →
-	// 직각으로 만나는 벽의 절반두께를 딱 덮어 코너를 메우되, 통로로 튀어나오지 않는다.
-	const double CornerOverlap = FMath::Min<double>(WallThickness, RenderedThickness);
-
-	const float ScaleThickness = static_cast<float>(HUniform);                          // Y=X 균일.
-	const float ScaleLength    = static_cast<float>((CellSize + CornerOverlap) / SizeX); // 코너 메움만큼만 길게.
-	const float ScaleHeight    = static_cast<float>(WallHeight / SizeZ);                 // 높이는 독립.
-	const FVector WallScale(ScaleLength, ScaleThickness, ScaleHeight);
-
-	// 피벗이 중앙이 아니어도 정렬되도록, 스케일된 바운드 중심을 셀 모서리에 맞춘다.
-	// (큐브는 Origin=0이라 보정 0 → 기존 동작과 동일.)
-	const FVector ScaledBoundsOffset = MeshBounds.Origin * WallScale;
+	// 메시 스케일/피벗 보정은 ComputeWallGeom과 한 곳(GetWallMeshScaling)에서 산출 — 동적 생성 벽과 동일.
+	FVector WallScale, ScaledBoundsOffset;
+	GetWallMeshScaling(WallScale, ScaledBoundsOffset);
 
 	// 길이 축이 +X가 아닌 메시를 위한 사용자 보정 Yaw.
 	const float YawOffset = WallMeshYawOffset;
@@ -599,6 +574,312 @@ void AMazeGenerator::ClearWallBetween(FIntPoint A, FIntPoint B)
 	else if (B.X == A.X - 1) { Cells[Index(A.X, A.Y)] &= ~Wall_West;  Cells[Index(B.X, B.Y)] &= ~Wall_East;  }
 }
 
+void AMazeGenerator::SetWallBetween(FIntPoint A, FIntPoint B)
+{
+	if (!Cells.IsValidIndex(Index(A.X, A.Y)) || !Cells.IsValidIndex(Index(B.X, B.Y)))
+	{
+		return;
+	}
+	if (B.Y == A.Y + 1)      { Cells[Index(A.X, A.Y)] |= Wall_North; Cells[Index(B.X, B.Y)] |= Wall_South; }
+	else if (B.Y == A.Y - 1) { Cells[Index(A.X, A.Y)] |= Wall_South; Cells[Index(B.X, B.Y)] |= Wall_North; }
+	else if (B.X == A.X + 1) { Cells[Index(A.X, A.Y)] |= Wall_East;  Cells[Index(B.X, B.Y)] |= Wall_West;  }
+	else if (B.X == A.X - 1) { Cells[Index(A.X, A.Y)] |= Wall_West;  Cells[Index(B.X, B.Y)] |= Wall_East;  }
+}
+
+bool AMazeGenerator::IsWallClosed(FIntPoint A, FIntPoint B) const
+{
+	if (!Cells.IsValidIndex(Index(A.X, A.Y)))
+	{
+		return true;
+	}
+	const uint8 W = Cells[Index(A.X, A.Y)];
+	if (B.Y == A.Y + 1) return (W & Wall_North) != 0;
+	if (B.Y == A.Y - 1) return (W & Wall_South) != 0;
+	if (B.X == A.X + 1) return (W & Wall_East)  != 0;
+	if (B.X == A.X - 1) return (W & Wall_West)  != 0;
+	return true; // 인접 아님 → 막힘 취급.
+}
+
+bool AMazeGenerator::EdgeOwner(FIntPoint A, FIntPoint B, int32& OutX, int32& OutY, int32& OutSide) const
+{
+	// 두 인접 셀 사이 벽은 항상 '아래/왼쪽 셀'의 North(0) 또는 East(1)로 소유된다.
+	if (B.Y == A.Y + 1)      { OutX = A.X; OutY = A.Y; OutSide = 0; }
+	else if (B.Y == A.Y - 1) { OutX = B.X; OutY = B.Y; OutSide = 0; }
+	else if (B.X == A.X + 1) { OutX = A.X; OutY = A.Y; OutSide = 1; }
+	else if (B.X == A.X - 1) { OutX = B.X; OutY = B.Y; OutSide = 1; }
+	else                     { return false; }
+	return true;
+}
+
+int64 AMazeGenerator::EdgeKey(FIntPoint A, FIntPoint B) const
+{
+	int32 X, Y, S;
+	if (!EdgeOwner(A, B, X, Y, S))
+	{
+		return -1;
+	}
+	return EncodeWallKey(X, Y, S);
+}
+
+void AMazeGenerator::GetWallMeshScaling(FVector& OutScale, FVector& OutBoundsOffset) const
+{
+	OutScale = FVector::OneVector;
+	OutBoundsOffset = FVector::ZeroVector;
+	if (!WallStaticMesh)
+	{
+		return;
+	}
+
+	// 메시 바운드에서 실제 크기/피벗을 읽어 스케일한다. 가정: 메시 로컬 X=길이, Y=두께, Z=높이.
+	const FBoxSphereBounds MeshBounds = WallStaticMesh->GetBounds();
+	const FVector MeshSize = MeshBounds.BoxExtent * 2.0; // 전체 크기 = 절반범위 ×2.
+	const double SizeX = FMath::Max<double>(MeshSize.X, UE_KINDA_SMALL_NUMBER);
+	const double SizeY = FMath::Max<double>(MeshSize.Y, UE_KINDA_SMALL_NUMBER);
+	const double SizeZ = FMath::Max<double>(MeshSize.Z, UE_KINDA_SMALL_NUMBER);
+
+	// 수평(X·Y)을 같은 배율(HUniform)로 묶어 균일 스케일 → 단면(두께:길이) 비율 유지.
+	const double HUniform = CellSize / SizeX;
+	const double RenderedThickness = SizeY * HUniform;
+	const double CornerOverlap = FMath::Min<double>(WallThickness, RenderedThickness);
+
+	const float ScaleThickness = static_cast<float>(HUniform);
+	const float ScaleLength    = static_cast<float>((CellSize + CornerOverlap) / SizeX);
+	const float ScaleHeight    = static_cast<float>(WallHeight / SizeZ);
+	OutScale = FVector(ScaleLength, ScaleThickness, ScaleHeight);
+	OutBoundsOffset = MeshBounds.Origin * OutScale;
+}
+
+bool AMazeGenerator::ComputeWallGeom(int32 X, int32 Y, int32 Side, FQuat& OutRot, FVector& OutScale, FVector& OutCenter, FVector& OutBoundsOffset) const
+{
+	if (!WallStaticMesh)
+	{
+		return false;
+	}
+	GetWallMeshScaling(OutScale, OutBoundsOffset);
+
+	const float HalfCell = CellSize * 0.5f;
+	const float HalfHeight = WallHeight * 0.5f;
+	const float CX = X * CellSize;
+	const float CY = Y * CellSize;
+
+	float BaseYaw = 0.f;
+	switch (Side)
+	{
+	case 0: OutCenter = FVector(CX, CY + HalfCell, HalfHeight); BaseYaw = 0.f;  break; // North
+	case 1: OutCenter = FVector(CX + HalfCell, CY, HalfHeight); BaseYaw = 90.f; break; // East
+	case 2: OutCenter = FVector(CX, CY - HalfCell, HalfHeight); BaseYaw = 0.f;  break; // South 경계
+	case 3: OutCenter = FVector(CX - HalfCell, CY, HalfHeight); BaseYaw = 90.f; break; // West 경계
+	default: return false;
+	}
+	OutRot = FRotator(0.f, BaseYaw + WallMeshYawOffset, 0.f).Quaternion();
+	return true;
+}
+
+FTransform AMazeGenerator::AnimXform(const FWallAnim& A, float OpenAmount) const
+{
+	const float O = FMath::Clamp(OpenAmount, 0.f, 1.f);
+	FQuat dq = FQuat::Identity;
+	FVector Center = A.Center;
+
+	switch (A.Style)
+	{
+	case EWallAnimStyle::Slide:
+		// 옆으로 한 칸 미끄러짐. 회전은 이동 중에만(sin: 양끝 0) → 정지 시 축 정렬되어 통로를 막지 않음.
+		dq = FQuat(FVector::UpVector, FMath::DegreesToRadians(WallOpenSpinDegrees * FMath::Sin(PI * O)));
+		Center = A.Center + A.SlideDir * (CellSize * O);
+		break;
+
+	case EWallAnimStyle::SwingDoor:
+	{
+		// 한쪽 끝(경첩)을 축으로 문처럼 회전(트인 쪽으로 돌도록 SwingSign 적용).
+		dq = FQuat(FVector::UpVector, FMath::DegreesToRadians(WallSwingDegrees * A.SwingSign * O));
+		const FVector Pivot = A.Center + A.PivotOffset;
+		Center = Pivot + dq.RotateVector(A.Center - Pivot);
+		break;
+	}
+
+	case EWallAnimStyle::RiseFall:
+		// O=1이면 바닥 아래(사라짐), O=0이면 제자리.
+		Center = A.Center + FVector(0.f, 0.f, -(WallHeight + 50.f) * O);
+		break;
+	}
+
+	const FQuat Rot = dq * A.BaseRot;
+	const FVector Loc = Center - Rot.RotateVector(A.BoundsOffset);
+	return FTransform(Rot, Loc, A.Scale);
+}
+
+AMazeGenerator::EWallAnimStyle AMazeGenerator::ResolveAnimStyle(FIntPoint A, FIntPoint B, EWallAnimStyle Desired,
+	FVector& OutSlideDir, FVector& OutPivotOffset, float& OutSwingSign,
+	FIntPoint& OutRestA, FIntPoint& OutRestB) const
+{
+	// 간선 기하: N=두 셀을 가르는 수직 스텝, Fc=벽 길이축 스텝(N에 수직).
+	const FIntPoint N = B - A;
+	const FIntPoint Fc(N.Y, -N.X);
+	const FVector FcV(static_cast<float>(Fc.X), static_cast<float>(Fc.Y), 0.f);
+
+	auto InGrid = [&](const FIntPoint& C)
+	{
+		return C.X >= 0 && C.X < GridWidth && C.Y >= 0 && C.Y < GridHeight;
+	};
+	// 안착 후보 슬롯이 쓸 수 있는지: 격자 내 + 비어 있고(열림) + 경로 간선이 아님(길 안 막음).
+	auto SlotUsable = [&](const FIntPoint& P, const FIntPoint& Q)
+	{
+		if (!InGrid(P) || !InGrid(Q) || IsWallClosed(P, Q))
+		{
+			return false;
+		}
+		const int64 K = EdgeKey(P, Q);
+		return K >= 0 && !RouteEdgeSet.Contains(K);
+	};
+
+	// 기본값(폴백/RiseFall): 수직으로 바닥에 가라앉아 사라짐 — 안착 슬롯 없음.
+	OutSlideDir = FcV;
+	OutPivotOffset = FVector::ZeroVector;
+	OutSwingSign = 1.f;
+	OutRestA = FIntPoint(-1, -1);
+	OutRestB = FIntPoint(-1, -1);
+
+	// 슬라이드: 길이축 +Fc/-Fc 중 동일선상 빈 비경로 슬롯으로 한 칸 미끄러져 정렬 안착.
+	auto TrySlide = [&]() -> bool
+	{
+		for (int32 s = 1; s >= -1; s -= 2)
+		{
+			const FIntPoint nA = A + Fc * s;
+			const FIntPoint nB = B + Fc * s;
+			if (SlotUsable(nA, nB))
+			{
+				OutSlideDir = FcV * static_cast<float>(s);
+				OutRestA = nA;
+				OutRestB = nB;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	// 문: 끝을 축으로 90° 회전해 수직 슬롯 (sideCell, sideCell+s*Fc)에 플러시 안착.
+	auto TrySwing = [&]() -> bool
+	{
+		struct FSide { FIntPoint Cell; int32 Sigma; };
+		const FSide Sides[2] = { { A, -1 }, { B, +1 } };
+		for (int32 s = 1; s >= -1; s -= 2)
+		{
+			for (const FSide& Sd : Sides)
+			{
+				const FIntPoint Block = Sd.Cell + Fc * s;
+				if (SlotUsable(Sd.Cell, Block))
+				{
+					OutPivotOffset = FcV * (static_cast<float>(s) * CellSize * 0.5f);
+					OutSwingSign = -static_cast<float>(s * Sd.Sigma); // 자유단이 대상 셀 쪽으로 회전.
+					OutRestA = Sd.Cell;
+					OutRestB = Block;
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+
+	// 구간이 원한 방식 우선, 안 되면 다른 방식, 둘 다 안 되면 RiseFall(완전히 막힘 → 바닥으로 꺼짐).
+	if (Desired == EWallAnimStyle::SwingDoor)
+	{
+		if (TrySwing()) return EWallAnimStyle::SwingDoor;
+		if (TrySlide()) return EWallAnimStyle::Slide;
+	}
+	else
+	{
+		if (TrySlide()) return EWallAnimStyle::Slide;
+		if (TrySwing()) return EWallAnimStyle::SwingDoor;
+	}
+	return EWallAnimStyle::RiseFall;
+}
+
+void AMazeGenerator::ScheduleOpenEdge(FIntPoint A, FIntPoint B, EWallAnimStyle Style)
+{
+	const int64 Key = EdgeKey(A, B);
+	if (Key < 0 || AnimatedEdges.Contains(Key))
+	{
+		return;
+	}
+	int32 Idx = INDEX_NONE;
+	if (!FindWallInstance(A, B, Idx))
+	{
+		return; // 이미 열린(렌더 안 된) 간선 → 열 것이 없음.
+	}
+	int32 X, Y, S;
+	if (!EdgeOwner(A, B, X, Y, S))
+	{
+		return;
+	}
+	FWallAnim An;
+	if (!ComputeWallGeom(X, Y, S, An.BaseRot, An.Scale, An.Center, An.BoundsOffset))
+	{
+		return;
+	}
+	An.InstanceIndex = Idx;
+	An.bOpening = true;
+	An.CellA = A;
+	An.CellB = B;
+	// 길을 막지 않게 안착할 비경로 빈 슬롯을 정함(슬라이드/문 불가 시 RiseFall=바닥으로 꺼짐).
+	An.Style = ResolveAnimStyle(A, B, Style, An.SlideDir, An.PivotOffset, An.SwingSign, An.RestSlotA, An.RestSlotB);
+	ActiveAnims.Add(An);
+	AnimatedEdges.Add(Key);
+
+	// 벽이 안착할 비경로 슬롯을 지금(스케줄 시점) 봉인 예약 → 애니 도중 닫기가 같은 자리에 이중 벽을 올리지 않게.
+	if (An.Style != EWallAnimStyle::RiseFall && An.RestSlotA.X >= 0)
+	{
+		const int64 RestKey = EdgeKey(An.RestSlotA, An.RestSlotB);
+		if (RestKey >= 0)
+		{
+			AnimatedEdges.Add(RestKey);
+			WallInstanceIndex.Add(RestKey, Idx);
+		}
+	}
+	++OpenedWallCount;
+}
+
+void AMazeGenerator::ScheduleCloseEdge(FIntPoint A, FIntPoint B, EWallAnimStyle Style)
+{
+	const int64 Key = EdgeKey(A, B);
+	if (Key < 0 || AnimatedEdges.Contains(Key) || !WallISM)
+	{
+		return;
+	}
+	int32 X, Y, S;
+	if (!EdgeOwner(A, B, X, Y, S))
+	{
+		return;
+	}
+	FWallAnim An;
+	if (!ComputeWallGeom(X, Y, S, An.BaseRot, An.Scale, An.Center, An.BoundsOffset))
+	{
+		return;
+	}
+	An.bOpening = false;
+	An.CellA = A;
+	An.CellB = B;
+	// 닫기는 항상 RiseFall(바닥에서 수직 솟기)로 들어옴 → 방향 결정 결과도 RiseFall.
+	An.Style = ResolveAnimStyle(A, B, Style, An.SlideDir, An.PivotOffset, An.SwingSign, An.RestSlotA, An.RestSlotB);
+
+	// 시작 위치 = '완전 개방' 상태 = 바닥 아래(안 보임). 여기서 솟아오르며 닫히므로 팝 없음.
+	const FTransform Gone = AnimXform(An, 1.f);
+	if (FreedWallPool.Num() > 0)
+	{
+		// 길을 열며 치운 벽을 재배치(재사용). 바닥 아래끼리 이동이라 보이지 않게 자리만 바뀜.
+		An.InstanceIndex = FreedWallPool.Pop();
+		WallISM->UpdateInstanceTransform(An.InstanceIndex, Gone, /*bWorldSpace=*/false, true, true);
+	}
+	else
+	{
+		// 재사용할 벽이 없으면 새로 추가하되, 역시 바닥 아래에서 시작 → 솟아오름(팝 없음).
+		An.InstanceIndex = WallISM->AddInstance(Gone, /*bWorldSpace=*/false);
+	}
+	WallInstanceIndex.Add(Key, An.InstanceIndex);
+	ActiveAnims.Add(An);
+	AnimatedEdges.Add(Key);
+}
+
 void AMazeGenerator::HandleGoalCleared()
 {
 	UWorld* World = GetWorld();
@@ -666,144 +947,66 @@ void AMazeGenerator::HandleGoalCleared()
 		}
 	}
 
-	// 미로 전면 폐쇄 → 여는 통로만 트리(loop 없음)로 구성 → 출구 닿는 길은 메인 하나뿐.
-	Cells.Init(Wall_All, GridWidth * GridHeight);
-	if (Rooms.Num() > 0)
-	{
-		OpenRoomInterior(Rooms[GetGoalRoomIndex()]); // 목표 방은 원래 크기로 유지.
-	}
-
-	// 전체 1회 렌더 + (X,Y,Side)→인스턴스 인덱스 기록. 피날레 동안 윈도우 갱신은 멈춤.
+	// 미로는 그대로 둔다(전면 폐쇄 금지). 실제 미로 위에서 경로 벽은 '열고', 경로 아닌 옆 통로는 다가오면 '닫는다'.
+	// 전체 1회 렌더 + (X,Y,Side)→인스턴스 인덱스 기록(경로의 닫힌 벽은 인스턴스 보유 → 열기 가능).
 	World->GetTimerManager().ClearTimer(WindowTimer);
 	bRecordInstanceMap = true;
 	BuildWallsInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
 	LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
 
-	// --- 구간 트리 구성(메인 + 미끼 분기) ---
+	// --- 연출 상태 초기화 ---
 	Segments.Reset();
 	OpenedWallCount = 0;
-	ActiveSlides.Reset();
+	ActiveAnims.Reset();
+	RouteEdgeSet.Reset();
+	AnimatedEdges.Reset();
+	RouteCells = MainCells;
+	RouteCellClosed.Init(false, RouteCells.Num());
+	FinaleStream = FRandomStream(Seed ^ 0x2545F491 ^ static_cast<int32>(FinaleAttempt * 40503u));
 
-	TMap<int32, int32> MainCellToSeg; // 메인 셀 인덱스 → 그 셀이 속한 구간 인덱스(분기 부모 찾기용).
-
-	// 가닥(직선 단위)으로 쪼개 Segments에 추가. CellToSeg가 있으면 셀→구간 매핑 기록.
-	auto Segmentize = [&](const TArray<FIntPoint>& Strand, int32 ParentForFirst, TMap<int32, int32>* CellToSeg)
+	// 목표 방(시작 공간) 캐시 — 이 안은 옆 통로 닫기에서 제외(열린 시작 공간 유지).
+	bFinaleHasGoalRoom = Rooms.Num() > 0;
+	if (bFinaleHasGoalRoom)
 	{
-		if (Strand.Num() < 2)
+		FinaleGoalRoom = Rooms[GetGoalRoomIndex()];
+	}
+
+	// 메인 경로 간선 집합 — 이 벽들은 절대 닫지 않는다(길 보장).
+	for (int32 i = 0; i + 1 < MainCells.Num(); ++i)
+	{
+		const int64 K = EdgeKey(MainCells[i], MainCells[i + 1]);
+		if (K >= 0)
 		{
-			return;
+			RouteEdgeSet.Add(K);
 		}
+	}
+
+	// 메인 경로를 직선 구간으로 쪼개 코너까지 통째로 열리게(구간마다 개방 방식을 다르게: 슬라이드/문).
+	{
 		int32 RunStart = 0;
-		FIntPoint Dir = Strand[1] - Strand[0];
-		int32 PrevSeg = ParentForFirst;
+		FIntPoint Dir = (MainCells.Num() >= 2) ? (MainCells[1] - MainCells[0]) : FIntPoint::ZeroValue;
+		int32 PrevSeg = INDEX_NONE;
 		auto FlushRun = [&](int32 EndIdx)
 		{
 			FRevealSegment Seg;
 			for (int32 k = RunStart; k < EndIdx; ++k)
 			{
-				Seg.Edges.Emplace(Strand[k], Strand[k + 1]);
+				Seg.Edges.Emplace(MainCells[k], MainCells[k + 1]);
 			}
-			Seg.TriggerWorld = GetCellCenterWorld(Strand[RunStart].X, Strand[RunStart].Y);
+			Seg.TriggerWorld = GetCellCenterWorld(MainCells[RunStart].X, MainCells[RunStart].Y);
 			Seg.Parent = PrevSeg;
-			const int32 SegIdx = Segments.Add(Seg);
-			if (CellToSeg)
-			{
-				for (int32 k = RunStart; k <= EndIdx; ++k)
-				{
-					CellToSeg->FindOrAdd(Index(Strand[k].X, Strand[k].Y)) = SegIdx;
-				}
-			}
-			PrevSeg = SegIdx;
+			Seg.Style = static_cast<EWallAnimStyle>(FinaleStream.RandRange(0, 1)); // 열기: Slide/SwingDoor.
+			PrevSeg = Segments.Add(Seg);
 			RunStart = EndIdx;
 		};
-		for (int32 i = 1; i + 1 < Strand.Num(); ++i)
+		for (int32 i = 1; i + 1 < MainCells.Num(); ++i)
 		{
-			const FIntPoint D = Strand[i + 1] - Strand[i];
+			const FIntPoint D = MainCells[i + 1] - MainCells[i];
 			if (D != Dir) { FlushRun(i); Dir = D; }
 		}
-		FlushRun(Strand.Num() - 1);
-	};
-
-	Segmentize(MainCells, INDEX_NONE, &MainCellToSeg);
-
-	// 미끼(막다른) 분기: 메인 복도의 '직선 구간·방 밖'에서 옆(수직)으로 곁가지를 낸다.
-	// 첫 걸음을 메인 방향에 수직으로 강제 → 평행/역방향/방안 분기 없이 자연스러운 옆길. 셀 유일성으로 loop 방지.
-	if (MainCells.Num() >= 3)
-	{
-		TSet<int32> Visited;
-		for (const FIntPoint& C : MainCells)
+		if (MainCells.Num() >= 2)
 		{
-			Visited.Add(Index(C.X, C.Y));
-		}
-		const FIntPoint Dirs4[4] = { FIntPoint(1,0), FIntPoint(-1,0), FIntPoint(0,1), FIntPoint(0,-1) };
-		const int32 LenMax = FMath::Max(DecoyBranchLenMin, DecoyBranchLenMax);
-
-		const bool bHasRoom = Rooms.Num() > 0;
-		const FIntRect GoalRoom = bHasRoom ? Rooms[GetGoalRoomIndex()] : FIntRect();
-		auto InGoalRoom = [&](const FIntPoint& C)
-		{
-			return bHasRoom && C.X >= GoalRoom.Min.X && C.X < GoalRoom.Max.X
-				&& C.Y >= GoalRoom.Min.Y && C.Y < GoalRoom.Max.Y;
-		};
-
-		for (int32 b = 0; b < DecoyBranchCount; ++b)
-		{
-			// 직선 구간 + 방 밖 + 수직 곁길 가능한 루트 찾기(재시도).
-			int32 RootIdx = INDEX_NONE;
-			FIntPoint PerpDir = FIntPoint::ZeroValue;
-			for (int32 Attempt = 0; Attempt < 16; ++Attempt)
-			{
-				const int32 ri = Stream.RandRange(1, MainCells.Num() - 2);
-				const FIntPoint In = MainCells[ri] - MainCells[ri - 1];
-				const FIntPoint Out = MainCells[ri + 1] - MainCells[ri];
-				if (In != Out) continue;              // 직선 구간만(코너 제외).
-				if (InGoalRoom(MainCells[ri])) continue; // 방 안 제외.
-
-				// 메인 방향에 수직인 두 후보 중 미사용·격자 내.
-				const FIntPoint Perps[2] = { FIntPoint(-Out.Y, Out.X), FIntPoint(Out.Y, -Out.X) };
-				TArray<FIntPoint, TInlineAllocator<2>> Ok;
-				for (const FIntPoint& Pd : Perps)
-				{
-					const FIntPoint N = MainCells[ri] + Pd;
-					if (N.X < 0 || N.X >= GridWidth || N.Y < 0 || N.Y >= GridHeight) continue;
-					if (Visited.Contains(Index(N.X, N.Y))) continue;
-					Ok.Add(Pd);
-				}
-				if (Ok.Num() == 0) continue;
-				RootIdx = ri;
-				PerpDir = Ok[Stream.RandRange(0, Ok.Num() - 1)];
-				break;
-			}
-			if (RootIdx == INDEX_NONE) continue; // 적당한 루트 없음 → 이 분기 스킵.
-
-			const FIntPoint Root = MainCells[RootIdx];
-			TArray<FIntPoint> Strand;
-			Strand.Add(Root);
-			FIntPoint Cur = Root + PerpDir; // 첫 걸음 = 옆(수직).
-			Visited.Add(Index(Cur.X, Cur.Y));
-			Strand.Add(Cur);
-
-			const int32 Len = Stream.RandRange(DecoyBranchLenMin, LenMax);
-			for (int32 s = 1; s < Len; ++s)
-			{
-				TArray<FIntPoint, TInlineAllocator<4>> Cand;
-				for (const FIntPoint& D : Dirs4)
-				{
-					const FIntPoint N = Cur + D;
-					if (N.X < 0 || N.X >= GridWidth || N.Y < 0 || N.Y >= GridHeight) continue;
-					if (Visited.Contains(Index(N.X, N.Y))) continue;
-					Cand.Add(N);
-				}
-				if (Cand.Num() == 0) break;
-				const FIntPoint N = Cand[Stream.RandRange(0, Cand.Num() - 1)];
-				Visited.Add(Index(N.X, N.Y));
-				Strand.Add(N);
-				Cur = N;
-			}
-			if (Strand.Num() >= 2)
-			{
-				Segmentize(Strand, MainCellToSeg.FindRef(Index(Root.X, Root.Y)), nullptr);
-			}
+			FlushRun(MainCells.Num() - 1);
 		}
 	}
 
@@ -852,7 +1055,7 @@ void AMazeGenerator::HandleGoalCleared()
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 6.f, FColor::Orange,
-			TEXT("길이 갈라진다! 진짜 출구(빛기둥)를 찾아 탈출하라!"));
+			TEXT("벽이 열리고 닫힌다! 빛기둥을 향한 길을 따라 탈출하라!"));
 	}
 	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 피날레 시작 — 출구 (%d,%d), 구간 %d개."),
 		ExitCell.X, ExitCell.Y, Segments.Num());
@@ -900,8 +1103,9 @@ void AMazeGenerator::Tick(float DeltaSeconds)
 		}
 	}
 
-	// 구간(코너) 단위 개방: 부모 구간이 열렸고 플레이어가 구간 시작에 근접하면 그 구간 벽 전체를 한 번에 연다.
-	bool bAnySegmentOpenedThisFrame = false;
+	bool bAnyChangeThisFrame = false;
+
+	// (1) 경로 구간 열기: 부모 구간이 열렸고 플레이어가 구간 시작에 근접 → 그 구간 벽들을 '열기'(치움).
 	for (FRevealSegment& Seg : Segments)
 	{
 		if (Seg.bOpened)
@@ -913,65 +1117,91 @@ void AMazeGenerator::Tick(float DeltaSeconds)
 		{
 			continue;
 		}
-
 		Seg.bOpened = true;
-		bAnySegmentOpenedThisFrame = true;
+		bAnyChangeThisFrame = true;
 		for (const TPair<FIntPoint, FIntPoint>& E : Seg.Edges)
 		{
-			int32 Idx = INDEX_NONE;
-			if (FindWallInstance(E.Key, E.Value, Idx))
-			{
-				FTransform Start;
-				if (WallISM->GetInstanceTransform(Idx, Start, /*bWorldSpace=*/false))
-				{
-					FWallSlide Slide;
-					Slide.InstanceIndex = Idx;
-					Slide.StartXform = Start;
-					// 옆으로 밀면 폐쇄 미로의 이웃 벽과 겹쳐 어색 → 바닥 속으로 가라앉혀 매끄럽게 연다.
-					Slide.SlideOffset = FVector(0.f, 0.f, -(WallHeight + 100.f));
-					Slide.CellA = E.Key;
-					Slide.CellB = E.Value;
-					ActiveSlides.Add(Slide);
-					++OpenedWallCount;
-				}
-			}
+			ScheduleOpenEdge(E.Key, E.Value, Seg.Style);
 		}
 	}
 
-	// 구간이 열린 프레임엔 가벼운 카메라 흔들림(벽이 움직이는 타격감).
-	if (bAnySegmentOpenedThisFrame)
+	// (2) 경로 아닌 옆 통로 닫기: 플레이어가 경로 셀에 근접하면 그 셀의 '경로 아닌' 열린 옆면에 벽을 새로 생성.
+	const FIntPoint Dirs4[4] = { FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1) };
+	for (int32 i = 0; i < RouteCells.Num(); ++i)
 	{
-		if (APlayerController* PC = GetWorld()->GetFirstPlayerController())
+		if (RouteCellClosed[i])
 		{
-			PC->ClientStartCameraShake(UFinaleCameraShake::StaticClass(), 0.2f);
+			continue;
+		}
+		const FIntPoint C = RouteCells[i];
+		if (FVector::Dist2D(PlayerLoc, GetCellCenterWorld(C.X, C.Y)) > CloseAheadDistance)
+		{
+			continue;
+		}
+		RouteCellClosed[i] = true;
+
+		// 목표 방(시작 공간)은 닫지 않고 열린 채 둔다.
+		if (bFinaleHasGoalRoom && C.X >= FinaleGoalRoom.Min.X && C.X < FinaleGoalRoom.Max.X
+			&& C.Y >= FinaleGoalRoom.Min.Y && C.Y < FinaleGoalRoom.Max.Y)
+		{
+			continue;
+		}
+
+		for (const FIntPoint& D : Dirs4)
+		{
+			const FIntPoint N = C + D;
+			if (N.X < 0 || N.X >= GridWidth || N.Y < 0 || N.Y >= GridHeight)
+			{
+				continue; // 격자 경계(이미 외벽).
+			}
+			if (IsWallClosed(C, N))
+			{
+				continue; // 이미 벽이 있음.
+			}
+			const int64 K = EdgeKey(C, N);
+			if (K < 0 || RouteEdgeSet.Contains(K))
+			{
+				continue; // 경로 벽은 닫지 않음.
+			}
+			// 닫기: 슬라이드/회전 없이 바닥에서 수직으로만 솟아올라 슬롯에 맞게 닫힘.
+			ScheduleCloseEdge(C, N, EWallAnimStyle::RiseFall);
+			bAnyChangeThisFrame = true;
 		}
 	}
 
-	// 추격자 등장은 추격자가 자체 판단(플레이어가 ChaserStartCells칸 전진 시). 여기선 불필요.
+	// 벽 열림/닫힘에는 흔들림 없음(잡힐 때만 흔들림 — HandlePlayerCaught).
+	(void)bAnyChangeThisFrame;
 
-	// 진행 중 슬라이드 갱신.
+	// (3) 진행 중 개폐 애니 갱신.
 	const float Dur = FMath::Max(0.05f, WallSlideDuration);
-	for (int32 i = ActiveSlides.Num() - 1; i >= 0; --i)
+	for (int32 i = ActiveAnims.Num() - 1; i >= 0; --i)
 	{
-		FWallSlide& S = ActiveSlides[i];
-		S.Elapsed += DeltaSeconds;
-		const float Alpha = FMath::Clamp(S.Elapsed / Dur, 0.f, 1.f);
+		FWallAnim& An = ActiveAnims[i];
+		An.Elapsed += DeltaSeconds;
+		const float Alpha = FMath::Clamp(An.Elapsed / Dur, 0.f, 1.f);
+		const float Open = An.bOpening ? Alpha : (1.f - Alpha); // 0=제자리, 1=사라짐.
 
 		if (Alpha < 1.f)
 		{
-			FTransform New = S.StartXform;
-			New.SetTranslation(S.StartXform.GetTranslation() + S.SlideOffset * Alpha);
-			WallISM->UpdateInstanceTransform(S.InstanceIndex, New, /*bWorldSpace=*/false,
-				/*bMarkRenderStateDirty=*/true, /*bTeleport=*/true);
+			WallISM->UpdateInstanceTransform(An.InstanceIndex, AnimXform(An, Open),
+				/*bWorldSpace=*/false, /*bMarkRenderStateDirty=*/true, /*bTeleport=*/true);
+		}
+		else if (An.bOpening)
+		{
+			// 열림 완료: 데이터에서 벽 제거 + 회전/슬라이드가 끝난 자리에 인스턴스를 그대로 둔다.
+			// (순간 사라지거나 다른 데서 올라오지 않음 — 옆 슬롯에 정렬/문처럼 열린 상태로 정지.
+			//  사방이 막혀 RiseFall로 처리된 벽은 AnimXform(O=1)=바닥 아래 → 그대로 가라앉아 사라짐.)
+			// 안착 슬롯 봉인은 스케줄 시점(ScheduleOpenEdge)에서 이미 예약됨(애니 도중 이중 벽 방지).
+			ClearWallBetween(An.CellA, An.CellB);
+			WallISM->UpdateInstanceTransform(An.InstanceIndex, AnimXform(An, 1.f), /*bWorldSpace=*/false, true, true);
+			ActiveAnims.RemoveAtSwap(i);
 		}
 		else
 		{
-			// 완료: 데이터에서 벽 제거 + 인스턴스를 바닥 한참 아래로 숨김(충돌도 무력화).
-			ClearWallBetween(S.CellA, S.CellB);
-			FTransform Hidden = S.StartXform;
-			Hidden.SetTranslation(S.StartXform.GetTranslation() + S.SlideOffset - FVector(0.f, 0.f, 100000.f));
-			WallISM->UpdateInstanceTransform(S.InstanceIndex, Hidden, /*bWorldSpace=*/false, true, true);
-			ActiveSlides.RemoveAtSwap(i);
+			// 닫힘 완료: 데이터에 벽 추가 + 인스턴스를 정확히 제자리로.
+			SetWallBetween(An.CellA, An.CellB);
+			WallISM->UpdateInstanceTransform(An.InstanceIndex, AnimXform(An, 0.f), /*bWorldSpace=*/false, true, true);
+			ActiveAnims.RemoveAtSwap(i);
 		}
 	}
 
@@ -1030,8 +1260,14 @@ void AMazeGenerator::ResetFinaleToPreClear()
 	bRecordInstanceMap = false;
 	Segments.Reset();
 	OpenedWallCount = 0;
-	ActiveSlides.Reset();
+	ActiveAnims.Reset();
+	FreedWallPool.Reset();
 	WallInstanceIndex.Reset();
+	RouteCells.Reset();
+	RouteCellClosed.Reset();
+	RouteEdgeSet.Reset();
+	AnimatedEdges.Reset();
+	bFinaleHasGoalRoom = false;
 
 	// 추격자/출구 제거.
 	if (AMazeChaser* C = Chaser.Get())
