@@ -13,6 +13,8 @@ class UInstancedStaticMeshComponent;
 class UStaticMesh;
 class AMazeExit;
 class AMazeChaser;
+class USpotLightComponent;
+class UCameraComponent;
 
 /**
  * 시드 기반 결정론적 랜덤 미로 생성기 (Phase 1).
@@ -155,6 +157,48 @@ public:
 	/** 잡힘 시 암전(페이드 아웃)·복귀(페이드 인) 시간(초). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Finale", meta = (ClampMin = "0.0"))
 	float CaughtFadeTime = 0.5f;
+
+	// --- 관측-반응 시프트 모드 ("어둠 속, 안 보면 움직이는 미로") ---
+
+	/** 켜면 플레이어가 보지 않는(빛 밖 어둠) 근처 벽이 주기적으로 재배열된다(앞 열고 뒤 닫기). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
+	bool bShiftMode = false;
+
+	/** 시프트 1회 사이클 주기(초). 짧을수록 자주 바뀜. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.05"))
+	float ShiftInterval = 1.5f;
+
+	/** 한 사이클에 바꿀 최대 벽 수(열기+닫기 합). 작을수록 국소적으로 스멀스멀 바뀜. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
+	int32 ShiftBudgetPerCycle = 3;
+
+	/** 관측(얼림) 판정용 카메라 원뿔 반각(도). 손전등 OuterConeAngle과 대충 맞춘다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1.0", ClampMax = "179.0"))
+	float ObserveConeAngle = 50.f;
+
+	/** 관측(얼림) 판정 최대 거리(cm). 이 안 + 원뿔 안의 벽은 얼어붙는다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
+	float ObserveRange = 1500.f;
+
+	/** 플레이어 주변 이 반경(cm) 안의 벽은 시야와 무관하게 항상 얼림(코앞 봉쇄/끼임 방지). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
+	float FreezeRadius = 250.f;
+
+	/** 시프트 후보를 고려할 플레이어 주변 셀 반경. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
+	int32 ShiftRadiusCells = 6;
+
+	/** 켜면 시프트 후보 벽(얼림/열기후보/닫기후보)과 원뿔을 디버그 드로로 표시(개발용). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
+	bool bShiftDebugDraw = true;
+
+	/** 켜면 시프트 모드에서 플레이어 카메라에 손전등(스포트라이트)을 코드로 부착(어둠 동행, BP 불필요). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
+	bool bShiftFlashlight = true;
+
+	/** 손전등 밝기. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
+	float FlashlightIntensity = 5000.f;
 
 	/** 미로 데이터를 (재)생성한다(렌더는 윈도우가 담당). 디테일 패널 버튼 또는 BP에서 호출 가능. */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Maze")
@@ -390,4 +434,28 @@ private:
 
 	/** 렌더 윈도우 갱신 타이머 핸들. */
 	FTimerHandle WindowTimer;
+
+	// --- 관측-반응 시프트 모드 내부 상태/헬퍼 ---
+
+	/** 시프트 사이클 타이머. */
+	FTimerHandle ShiftTimer;
+
+	/** 시프트 대상 선택용 난수(결정론 불필요, 매번 다른 재배열). */
+	FRandomStream ShiftStream;
+
+	/** 연결성 보장 목표 셀(플레이어→이 셀 경로가 항상 유지되도록 닫기를 가드). */
+	FIntPoint ShiftGoalCell = FIntPoint(0, 0);
+	bool bShiftGoalValid = false;
+
+	/** 코드로 플레이어 카메라에 부착한 손전등(시프트 모드 어둠 동행). */
+	TWeakObjectPtr<USpotLightComponent> Flashlight;
+
+	/** 시프트 1회 사이클: 어둠 속 근처 벽을 예산제로 앞 열기/뒤 닫기(안전·연결성 가드 포함). */
+	void ShiftTick();
+
+	/** 월드 점이 카메라 원뿔(반각 ObserveConeAngle, 거리 ObserveRange) 안인지 = 관측(얼림). */
+	bool IsPointObserved(const FVector& WorldPoint, const FVector& CamLoc, const FVector& CamFwd) const;
+
+	/** From 셀에서 To 셀까지 현재 열린 간선만으로 도달 가능한지(BFS). 닫기 연결성 가드용. */
+	bool IsCellReachable(FIntPoint From, FIntPoint To) const;
 };
