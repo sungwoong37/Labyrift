@@ -15,6 +15,7 @@ class AMazeExit;
 class AMazeChaser;
 class USpotLightComponent;
 class UCameraComponent;
+class APawn;
 
 /**
  * 시드 기반 결정론적 랜덤 미로 생성기 (Phase 1).
@@ -184,9 +185,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
 	float FreezeRadius = 250.f;
 
-	/** 시프트 후보를 고려할 플레이어 주변 셀 반경. */
+	/** 경로상 플레이어 앞 이 칸 수까지의 닫힌 경로 간선을 (어둠 속이면) 연다. 클수록 더 멀리 앞서 길이 열림. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
-	int32 ShiftRadiusCells = 6;
+	int32 ShiftForwardCells = 4;
+
+	/** 경로상 플레이어 뒤 이 칸 수까지의 경로 셀에서, 비경로 옆 간선을 (어둠 속이면) 닫는다(백트래킹 봉인). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
+	int32 ShiftBackCells = 3;
 
 	/** 켜면 시프트 후보 벽(얼림/열기후보/닫기후보)과 원뿔을 디버그 드로로 표시(개발용). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
@@ -450,12 +455,35 @@ private:
 	/** 코드로 플레이어 카메라에 부착한 손전등(시프트 모드 어둠 동행). */
 	TWeakObjectPtr<USpotLightComponent> Flashlight;
 
-	/** 시프트 1회 사이클: 어둠 속 근처 벽을 예산제로 앞 열기/뒤 닫기(안전·연결성 가드 포함). */
+	/** 시프트 경로(플레이어 시작→목표) + 렌더가 준비되어 Tick이 개폐 애니를 구동하는 상태. */
+	bool bShiftActive = false;
+
+	/** 첫 ShiftTick에서 1회: 플레이어 시작→목표 staircase 경로(RouteCells/RouteEdgeSet) 산출 + Tick 활성. */
+	void InitShiftRun();
+
+	/** 시프트 1회 사이클: 어둠 속 경로 앞 열기/뒤 닫기를 피날레식 실시간 애니로 예약(안전·연결성 가드 포함). */
 	void ShiftTick();
+
+	/** 시프트 모드: 플레이어 카메라에 손전등(스포트라이트)을 코드로 1회 부착(관측 파라미터와 원뿔/사거리 일치). */
+	void EnsureShiftFlashlight(APawn* Pawn);
+
+	/** 어떤 경우에도 플레이어→목표 길을 보장: 단절 시 어둠 우선 최소-벽 경로(Dijkstra)를 찾아 즉시 개통. 연 벽 수 반환. */
+	int32 RepairConnectivityToGoal(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd);
+
+	/** 시프트 디버그 시각화: 관측 원뿔 + 플레이어→목표 실제 경로선(BFS). bShiftDebugDraw일 때만 호출. */
+	void DrawShiftDebug(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd) const;
+
+	/** 인접 두 셀 A,B 사이 간선의 월드 중점(벽 높이 절반 Z). 관측/디버그/복구에서 공통 사용. */
+	FVector EdgeMidWorld(FIntPoint A, FIntPoint B) const;
+
+	/** 닫히며 솟는 벽(C,N)이 플레이어 캡슐과 겹쳐 밀어낼지 — 겹치면 이번 프레임 닫기 보류. 피날레/시프트 공용. */
+	bool WallWouldHitPlayer(FIntPoint C, FIntPoint N, const FVector& PlayerLoc) const;
 
 	/** 월드 점이 카메라 원뿔(반각 ObserveConeAngle, 거리 ObserveRange) 안인지 = 관측(얼림). */
 	bool IsPointObserved(const FVector& WorldPoint, const FVector& CamLoc, const FVector& CamFwd) const;
 
-	/** From 셀에서 To 셀까지 현재 열린 간선만으로 도달 가능한지(BFS). 닫기 연결성 가드용. */
-	bool IsCellReachable(FIntPoint From, FIntPoint To) const;
+	/** From 셀에서 To 셀까지 현재 열린 간선만으로 도달 가능한지(BFS). 닫기 연결성 가드용.
+	 *  ExtraClosedEdges가 주어지면 그 간선들(EdgeKey)도 '닫힘(벽)'으로 간주한다 — 아직 Cells에
+	 *  반영 안 된 진행 중/이번 틱 예정 닫기들을 누적 반영해 '합쳐서 길 막힘'을 방지. */
+	bool IsCellReachable(FIntPoint From, FIntPoint To, const TSet<int64>* ExtraClosedEdges = nullptr) const;
 };

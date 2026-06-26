@@ -75,9 +75,38 @@ void AMazeGenerator::BeginPlay()
 	// 레벨의 퍼즐/목표 액터를 방에 분배(퍼즐=서로 다른 방, 목표=가장 먼 방).
 	DistributeRoomActors();
 
-	// 플레이어 주변만 렌더하는 윈도우를 주기적으로 갱신.
 	if (UWorld* World = GetWorld())
 	{
+		// 관측-반응 시프트 모드: 어둠 속에서 보지 않는 경로 벽을 실시간 애니로 앞 열고 뒤 닫는다(헤드라인 메커니즘).
+		if (bShiftMode)
+		{
+			// 시프트는 피날레식 개폐 애니를 쓴다 → 인스턴스 인덱스가 안정해야 한다(윈도우 재빌드 금지).
+			// 미로 전체를 1회 렌더하며 (X,Y,Side)→인스턴스 인덱스를 기록하고, 윈도우 타이머는 시작하지 않는다.
+			// (대형 미로는 전체 렌더 비용↑ — 헤드라인 데모는 걸어다닐 규모라 무방. 윈도우+애니 병행은 Phase 4.)
+			bRecordInstanceMap = true;
+			BuildWallsInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
+			LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
+
+			// 연결성 가드 목표 셀 = 가장 먼 방 중심(없으면 반대편 코너). 경로 staircase의 도착점이기도 하다.
+			if (Rooms.Num() > 0)
+			{
+				const FIntRect& GR = Rooms[GetGoalRoomIndex()];
+				ShiftGoalCell = FIntPoint((GR.Min.X + GR.Max.X - 1) / 2, (GR.Min.Y + GR.Max.Y - 1) / 2);
+			}
+			else
+			{
+				ShiftGoalCell = FIntPoint(GridWidth - 1, GridHeight - 1);
+			}
+			bShiftGoalValid = true;
+			ShiftStream.Initialize(Seed ^ 0x9E3779B9);
+			// 경로 산출은 플레이어 폰이 준비된 첫 ShiftTick에서(InitShiftRun). 타이머만 건다.
+			World->GetTimerManager().SetTimer(ShiftTimer, this, &AMazeGenerator::ShiftTick, ShiftInterval, /*bLoop=*/true);
+			UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: ShiftMode ON, timer=%.2fs, goal=(%d,%d)."), ShiftInterval, ShiftGoalCell.X, ShiftGoalCell.Y);
+			if (GEngine) { GEngine->AddOnScreenDebugMessage(-1, 8.f, FColor::Green, TEXT("ShiftMode ON (timer started)")); }
+			return; // 시프트 모드에선 윈도우 타이머/피날레 구독을 쓰지 않는다(인덱스 보존 + 충돌 방지).
+		}
+
+		// 일반/피날레 모드: 플레이어 주변만 렌더하는 윈도우를 주기적으로 갱신.
 		UpdateRenderWindow();
 		World->GetTimerManager().SetTimer(WindowTimer, this, &AMazeGenerator::UpdateRenderWindow, WindowUpdateInterval, /*bLoop=*/true);
 
@@ -91,30 +120,6 @@ void AMazeGenerator::BeginPlay()
 					Goal->OnGoalCleared.AddDynamic(this, &AMazeGenerator::HandleGoalCleared);
 				}
 			}
-		}
-
-		// 관측-반응 시프트 모드: 어둠 속 근처 벽을 주기적으로 재배열.
-		if (bShiftMode)
-		{
-			// 연결성 가드 목표 셀 = 가장 먼 방 중심(없으면 반대편 코너).
-			if (Rooms.Num() > 0)
-			{
-				const FIntRect& GR = Rooms[GetGoalRoomIndex()];
-				ShiftGoalCell = FIntPoint((GR.Min.X + GR.Max.X - 1) / 2, (GR.Min.Y + GR.Max.Y - 1) / 2);
-			}
-			else
-			{
-				ShiftGoalCell = FIntPoint(GridWidth - 1, GridHeight - 1);
-			}
-			bShiftGoalValid = true;
-			ShiftStream.Initialize(Seed ^ 0x9E3779B9);
-			World->GetTimerManager().SetTimer(ShiftTimer, this, &AMazeGenerator::ShiftTick, ShiftInterval, /*bLoop=*/true);
-			UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: ShiftMode ON, timer=%.2fs, goal=(%d,%d)."), ShiftInterval, ShiftGoalCell.X, ShiftGoalCell.Y);
-			if (GEngine) { GEngine->AddOnScreenDebugMessage(-1, 8.f, FColor::Green, TEXT("ShiftMode ON (timer started)")); }
-		}
-		else if (GEngine)
-		{
-			GEngine->AddOnScreenDebugMessage(-1, 8.f, FColor::Red, TEXT("ShiftMode OFF (bShiftMode=false)"));
 		}
 	}
 }
@@ -583,7 +588,7 @@ bool AMazeGenerator::IsPointObserved(const FVector& WorldPoint, const FVector& C
 	return FVector::DotProduct(CamFwd, Dir) >= CosHalf; // 원뿔 반각 안 = 관측.
 }
 
-bool AMazeGenerator::IsCellReachable(FIntPoint From, FIntPoint To) const
+bool AMazeGenerator::IsCellReachable(FIntPoint From, FIntPoint To, const TSet<int64>* ExtraClosedEdges) const
 {
 	if (From == To)
 	{
@@ -594,6 +599,13 @@ bool AMazeGenerator::IsCellReachable(FIntPoint From, FIntPoint To) const
 	{
 		return false;
 	}
+	// 추가 닫힘 간선(아직 Cells 미반영) 검사: 두 셀 사이가 ExtraClosedEdges에 있으면 벽으로 취급.
+	auto BlockedExtra = [&](FIntPoint A, FIntPoint B) -> bool
+	{
+		if (!ExtraClosedEdges) { return false; }
+		const int64 K = EdgeKey(A, B);
+		return K >= 0 && ExtraClosedEdges->Contains(K);
+	};
 	// 현재 '열린 간선'만 따라가는 BFS/DFS (벽이 없는 방향으로만 이동).
 	TBitArray<> Visited(false, NumCells);
 	TArray<int32> Stack;
@@ -611,19 +623,20 @@ bool AMazeGenerator::IsCellReachable(FIntPoint From, FIntPoint To) const
 		}
 		const int32 X = Cur % GridWidth;
 		const int32 Y = Cur / GridWidth;
+		const FIntPoint C(X, Y);
 		const uint8 W = Cells[Cur];
-		if (!(W & Wall_North) && Y + 1 < GridHeight) { const int32 Ni = Cur + GridWidth; if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
-		if (!(W & Wall_South) && Y - 1 >= 0)         { const int32 Ni = Cur - GridWidth; if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
-		if (!(W & Wall_East)  && X + 1 < GridWidth)  { const int32 Ni = Cur + 1;         if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
-		if (!(W & Wall_West)  && X - 1 >= 0)         { const int32 Ni = Cur - 1;         if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
+		if (!(W & Wall_North) && Y + 1 < GridHeight && !BlockedExtra(C, FIntPoint(X, Y + 1))) { const int32 Ni = Cur + GridWidth; if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
+		if (!(W & Wall_South) && Y - 1 >= 0         && !BlockedExtra(C, FIntPoint(X, Y - 1))) { const int32 Ni = Cur - GridWidth; if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
+		if (!(W & Wall_East)  && X + 1 < GridWidth  && !BlockedExtra(C, FIntPoint(X + 1, Y))) { const int32 Ni = Cur + 1;         if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
+		if (!(W & Wall_West)  && X - 1 >= 0         && !BlockedExtra(C, FIntPoint(X - 1, Y))) { const int32 Ni = Cur - 1;         if (!Visited[Ni]) { Visited[Ni] = true; Stack.Add(Ni); } }
 	}
 	return false;
 }
 
 void AMazeGenerator::ShiftTick()
 {
-	// 어둠 속(빛 밖) 근처 벽을 예산제로 앞은 열고 뒤는 닫는다(안전·연결성 가드). 변화는 안 보이고
-	// 빛을 비췄을 때 발견된다. bShiftDebugDraw면 후보를 색으로 표시.
+	// 관측-반응 시프트 1사이클: '의도된 경로'를 따라 어둠 속(빛 밖) 앞쪽 닫힌 간선은 열고, 지나온 뒤쪽 비경로
+	// 간선은 닫는다(예산제+연결성 가드). 끊기면 RepairConnectivityToGoal로 즉시 복구해 길을 보장한다.
 	UWorld* World = GetWorld();
 	if (!bShiftMode || bFinaleActive || !World || Cells.Num() == 0)
 	{
@@ -635,166 +648,408 @@ void AMazeGenerator::ShiftTick()
 		return;
 	}
 
-	// 카메라 원뿔(관측) origin/forward.
+	// 카메라 원뿔(관측) origin/forward + 플레이어 위치 + 손전등(최초 1회 부착).
 	FVector CamLoc; FRotator CamRot;
 	PC->GetPlayerViewPoint(CamLoc, CamRot);
 	const FVector CamFwd = CamRot.Vector();
-	FVector CamFwd2D(CamFwd.X, CamFwd.Y, 0.f);
-	CamFwd2D = CamFwd2D.GetSafeNormal(); // 앞/뒤 분류는 수평 기준(바닥을 봐도 흔들리지 않게).
-
-	// 플레이어 위치(얼림 반경 기준) + 손전등 부착(최초 1회).
 	FVector PlayerLoc = CamLoc;
 	if (APawn* Pawn = PC->GetPawn())
 	{
 		PlayerLoc = Pawn->GetActorLocation();
+		EnsureShiftFlashlight(Pawn);
+	}
 
-		// 손전등: 코드로 카메라에 부착(BP 불필요). 원뿔/사거리는 관측 파라미터와 일치시킨다.
-		if (bShiftFlashlight && !Flashlight.IsValid())
+	// 첫 사이클: 플레이어 시작→목표 경로 산출 + Tick 애니 구동 활성(폰이 준비된 지금 안전하게).
+	if (!bShiftActive)
+	{
+		InitShiftRun();
+	}
+	if (RouteCells.Num() < 2)
+	{
+		return; // 경로가 없으면(예: 시작==목표) 시프트 대상 없음.
+	}
+
+	const FIntPoint P = GetPlayerCell();
+	const float DrawZ = WallHeight * 0.5f;
+	const float FreezeRSq = FreezeRadius * FreezeRadius;
+
+	// 플레이어의 경로상 진행 인덱스 = 가장 가까운 경로 셀(앞/뒤를 경로 기준으로 가른다).
+	int32 PlayerRouteIdx = 0;
+	{
+		float Best = TNumericLimits<float>::Max();
+		for (int32 i = 0; i < RouteCells.Num(); ++i)
 		{
-			if (UCameraComponent* Cam = Pawn->FindComponentByClass<UCameraComponent>())
+			const float D = static_cast<float>(FVector::DistSquaredXY(PlayerLoc, GetCellCenterWorld(RouteCells[i].X, RouteCells[i].Y)));
+			if (D < Best) { Best = D; PlayerRouteIdx = i; }
+		}
+	}
+
+	// 어둠 속(=관측 안 됨, 코앞 아님, 얼림 반경 밖, 이미 애니 중 아님)일 때만 자유롭게 바꾼다 — 빛 안이면 얼림.
+	auto IsFree = [&](FIntPoint A, FIntPoint B, const FVector& Mid) -> bool
+	{
+		if (A == P || B == P) { return false; }                                  // 코앞 간선 고정(끼임 방지).
+		if (FVector::DistSquaredXY(PlayerLoc, Mid) < FreezeRSq) { return false; } // 얼림 반경 안.
+		if (IsPointObserved(Mid, CamLoc, CamFwd)) { return false; }              // 빛 안(관측) = 얼림.
+		const int64 K = EdgeKey(A, B);
+		if (K < 0 || AnimatedEdges.Contains(K)) { return false; }                // 이미 개폐 애니 중.
+		return true;
+	};
+
+	// 아직 Cells에 미반영된 '닫힐 간선' 집합 = 진행 중인 닫기 애니. 열기 루프-판정과 닫기 가드가 공유한다.
+	// (이번 틱에 확정하는 닫기는 아래 닫기 루프에서 누적 추가.)
+	TSet<int64> PendingClosed;
+	for (const FWallAnim& An : ActiveAnims)
+	{
+		if (!An.bOpening)
+		{
+			const int64 K = EdgeKey(An.CellA, An.CellB);
+			if (K >= 0) { PendingClosed.Add(K); }
+		}
+	}
+
+	// --- 후보 수집: '의도된 경로'만 대상(무작위 근처 개폐 금지) ---
+	// 열기: 플레이어 앞 ShiftForwardCells 칸의 '닫힌 경로 간선'(어둠 속) → 앞길이 열림.
+	// 단, 두 셀이 이미 다른 경로로 연결돼 있으면 열기 = 루프(도는 구간) 생성이므로 건너뛴다.
+	// → 닫기가 앞 경로를 끊은 드문 경우에만 복구용으로 열림(루프 절대 안 생김).
+	TArray<TPair<FIntPoint, FIntPoint>> OpenCands;
+	{
+		const int32 End = FMath::Min(PlayerRouteIdx + ShiftForwardCells, RouteCells.Num() - 1);
+		for (int32 i = PlayerRouteIdx; i < End; ++i)
+		{
+			const FIntPoint A = RouteCells[i];
+			const FIntPoint B = RouteCells[i + 1];
+			if (!IsWallClosed(A, B)) { continue; } // 이미 열림.
+			if (IsCellReachable(A, B, &PendingClosed)) { continue; } // 이미 연결됨 → 열면 루프 → 건너뜀.
+			const FVector Mid = EdgeMidWorld(A, B);
+			if (!IsFree(A, B, Mid)) { continue; }
+			OpenCands.Emplace(A, B);
+			if (bShiftDebugDraw) { DrawDebugBox(World, Mid, FVector(20, 20, DrawZ), FColor::Green, false, ShiftInterval * 1.1f, 0, 4.f); }
+		}
+	}
+
+	// 닫기: 플레이어 뒤 ShiftBackCells 칸의 경로 셀에서 '비경로 옆 간선'(현재 열림, 어둠 속) → 지나온 길 봉인.
+	TArray<TPair<FIntPoint, FIntPoint>> CloseCands;
+	{
+		const FIntPoint Dirs4[4] = { FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1) };
+		const int32 Begin = FMath::Max(0, PlayerRouteIdx - ShiftBackCells);
+		for (int32 i = Begin; i < PlayerRouteIdx; ++i)
+		{
+			const FIntPoint C = RouteCells[i];
+			// 방(공터/퍼즐 공간) 안 셀은 옆 간선을 닫지 않는다(열린 방 유지).
+			bool bInRoom = false;
+			for (const FIntRect& R : Rooms)
 			{
-				USpotLightComponent* Flash = NewObject<USpotLightComponent>(Pawn);
-				if (Flash)
-				{
-					Flash->SetMobility(EComponentMobility::Movable);
-					Flash->RegisterComponent();
-					Flash->AttachToComponent(Cam, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
-					Flash->SetRelativeLocationAndRotation(FVector::ZeroVector, FRotator::ZeroRotator);
-					Flash->SetAttenuationRadius(ObserveRange);
-					Flash->SetOuterConeAngle(ObserveConeAngle);
-					Flash->SetInnerConeAngle(FMath::Max(1.f, ObserveConeAngle * 0.6f));
-					Flash->SetIntensity(FlashlightIntensity);
-					Flash->SetCastShadows(true);
-					Flashlight = Flash;
-				}
+				if (C.X >= R.Min.X && C.X < R.Max.X && C.Y >= R.Min.Y && C.Y < R.Max.Y) { bInRoom = true; break; }
+			}
+			if (bInRoom) { continue; }
+			for (const FIntPoint& D : Dirs4)
+			{
+				const FIntPoint N = C + D;
+				if (N.X < 0 || N.X >= GridWidth || N.Y < 0 || N.Y >= GridHeight) { continue; }
+				if (IsWallClosed(C, N)) { continue; } // 이미 벽.
+				const int64 K = EdgeKey(C, N);
+				if (K < 0 || RouteEdgeSet.Contains(K)) { continue; } // 경로 간선은 닫지 않음(길 보장).
+				const FVector Mid = EdgeMidWorld(C, N);
+				if (!IsFree(C, N, Mid)) { continue; }
+				CloseCands.Emplace(C, N);
+				if (bShiftDebugDraw) { DrawDebugBox(World, Mid, FVector(20, 20, DrawZ), FColor::Red, false, ShiftInterval * 1.1f, 0, 4.f); }
 			}
 		}
 	}
 
-	const FIntPoint P = GetPlayerCell();
-	const int32 MinX = FMath::Clamp(P.X - ShiftRadiusCells, 0, GridWidth - 1);
-	const int32 MaxX = FMath::Clamp(P.X + ShiftRadiusCells, 0, GridWidth - 1);
-	const int32 MinY = FMath::Clamp(P.Y - ShiftRadiusCells, 0, GridHeight - 1);
-	const int32 MaxY = FMath::Clamp(P.Y + ShiftRadiusCells, 0, GridHeight - 1);
-	const float DrawZ = WallHeight * 0.5f;
-	const float FreezeRSq = FreezeRadius * FreezeRadius;
-
-	// 어둠 속 후보 수집: 앞쪽 닫힌 벽(열기 후보), 뒤쪽 열린 통로(닫기 후보).
-	TArray<TPair<FIntPoint, FIntPoint>> OpenCands;
-	TArray<TPair<FIntPoint, FIntPoint>> CloseCands;
-
-	// 한 간선(C,Nb)을 분류해 디버그 색으로 표시 + 자유 후보면 수집.
-	auto Consider = [&](FIntPoint C, FIntPoint Nb)
-	{
-		const FVector Mid = (GetCellCenterWorld(C.X, C.Y) + GetCellCenterWorld(Nb.X, Nb.Y)) * 0.5f + FVector(0, 0, DrawZ);
-
-		const bool bObserved = IsPointObserved(Mid, CamLoc, CamFwd);
-		const bool bNearPlayer = FVector::DistSquaredXY(PlayerLoc, Mid) < FreezeRSq;
-		const bool bAdjacent = (C == P) || (Nb == P);
-		const int64 K = EdgeKey(C, Nb);
-		const bool bRouteProtected = (K >= 0) && RouteEdgeSet.Contains(K);
-		const bool bFrozen = bObserved || bNearPlayer || bAdjacent || bRouteProtected;
-
-		const bool bClosed = IsWallClosed(C, Nb);
-		const FVector ToMid2D = (Mid - PlayerLoc) * FVector(1, 1, 0);
-		const bool bFront = FVector::DotProduct(ToMid2D.GetSafeNormal(), CamFwd2D) > 0.f;
-
-		FColor Col;
-		if (bFrozen)
-		{
-			Col = bRouteProtected ? FColor::Cyan : FColor::White; // 얼림(안 움직임).
-		}
-		else if (bClosed && bFront)
-		{
-			Col = FColor::Green;  // 어둠 속 앞쪽 닫힌 벽 → 열기 후보.
-			OpenCands.Emplace(C, Nb);
-		}
-		else if (!bClosed && !bFront)
-		{
-			Col = FColor::Red;    // 어둠 속 뒤쪽 열린 통로 → 닫기 후보.
-			CloseCands.Emplace(C, Nb);
-		}
-		else
-		{
-			Col = FColor(80, 80, 80); // 자유지만 이번 규칙 대상 아님.
-		}
-
-		if (bShiftDebugDraw)
-		{
-			DrawDebugBox(World, Mid, FVector(20, 20, DrawZ), Col, /*bPersistent=*/false, ShiftInterval * 1.1f, 0, 4.f);
-		}
-	};
-
-	for (int32 Y = MinY; Y <= MaxY; ++Y)
-	{
-		for (int32 X = MinX; X <= MaxX; ++X)
-		{
-			if (Y + 1 < GridHeight) { Consider(FIntPoint(X, Y), FIntPoint(X, Y + 1)); } // North 간선.
-			if (X + 1 < GridWidth)  { Consider(FIntPoint(X, Y), FIntPoint(X + 1, Y)); } // East 간선.
-		}
-	}
-
-	// --- 예산제 적용: 어둠 속 앞 열기 / 뒤 닫기 ---
-	int32 Changes = 0;
-
-	// 후보 섞기(Fisher-Yates) — 매 사이클 다른 곳이 바뀌게.
+	// 후보 섞기 — 매 사이클 다른 곳이 바뀌게.
 	auto Shuffle = [&](TArray<TPair<FIntPoint, FIntPoint>>& Arr)
 	{
-		for (int32 i = Arr.Num() - 1; i > 0; --i)
-		{
-			Arr.Swap(i, ShiftStream.RandRange(0, i));
-		}
+		for (int32 i = Arr.Num() - 1; i > 0; --i) { Arr.Swap(i, ShiftStream.RandRange(0, i)); }
 	};
 	Shuffle(OpenCands);
 	Shuffle(CloseCands);
 
-	// 열기: 통로를 '추가'하는 것이라 연결성은 절대 깨지지 않음.
-	const int32 OpenBudget = (ShiftBudgetPerCycle + 1) / 2;
-	int32 OpenDone = 0;
+	// --- 예산제 + 실시간 애니 예약(즉시 팝 없음 — 피날레식 슬라이드/문/솟기 재사용) ---
+	// 밀도 유지(공터화 방지): 열기(벽 제거)는 절반 이하, 나머지는 닫기(벽 생성) → 닫기 ≥ 열기.
+	int32 OpenDone = 0, CloseDone = 0;
+	const int32 OpenBudget = ShiftBudgetPerCycle / 2;
 	for (const TPair<FIntPoint, FIntPoint>& E : OpenCands)
 	{
 		if (OpenDone >= OpenBudget) { break; }
-		ClearWallBetween(E.Key, E.Value);
-		++OpenDone; ++Changes;
+		const EWallAnimStyle Style = static_cast<EWallAnimStyle>(FinaleStream.RandRange(0, 1)); // 열기: Slide/SwingDoor.
+		ScheduleOpenEdge(E.Key, E.Value, Style);
+		++OpenDone;
 	}
 
-	// 닫기: 남은 예산만큼. 플레이어→목표 경로가 유지될 때만 확정(아니면 되돌려 갇힘 방지).
-	const int32 CloseBudget = ShiftBudgetPerCycle - OpenDone;
-	int32 CloseDone = 0;
-	for (const TPair<FIntPoint, FIntPoint>& E : CloseCands)
+	// 닫기 연결성 가드(길 막힘 절대 금지): 후보를 PendingClosed(위에서 진행 중 닫기로 시드)에 누적 반영해
+	// 검사한다. 후보를 임시로 넣고 IsCellReachable(P→목표, ExtraClosed=PendingClosed)이 통과할 때만 확정.
+	// (개별 검사로는 두 닫기가 '합쳐서' 길을 막는 경우를 못 잡았다 → 누적 검사로 해결.)
+	const int32 CloseBudget = ShiftBudgetPerCycle - OpenDone; // 열기가 적으면 닫기가 더 많아져 밀도 유지.
+	// 목표가 유효하지 않으면(가드 불가) 닫기 전면 생략 — 안전(길 막힘) 우선.
+	if (bShiftGoalValid)
 	{
-		if (CloseDone >= CloseBudget) { break; }
-		SetWallBetween(E.Key, E.Value);
-		if (bShiftGoalValid && !IsCellReachable(P, ShiftGoalCell))
+		for (const TPair<FIntPoint, FIntPoint>& E : CloseCands)
 		{
-			ClearWallBetween(E.Key, E.Value); // 갇힘 유발 → 취소.
-			continue;
+			if (CloseDone >= CloseBudget) { break; }
+			if (WallWouldHitPlayer(E.Key, E.Value, PlayerLoc)) { continue; } // 솟는 벽이 플레이어와 겹침 → 보류.
+			const int64 K = EdgeKey(E.Key, E.Value);
+			if (K < 0) { continue; }
+			PendingClosed.Add(K); // 후보를 가정 포함.
+			if (!IsCellReachable(P, ShiftGoalCell, &PendingClosed))
+			{
+				PendingClosed.Remove(K); // 길 막힘 유발 → 이 후보 거부(나머지 후보는 계속 검사).
+				continue;
+			}
+			// 통과: 키를 PendingClosed에 유지(다음 후보가 이 닫기를 반영해 누적 검사).
+			ScheduleCloseEdge(E.Key, E.Value, EWallAnimStyle::RiseFall); // 닫기는 항상 바닥 솟기(팝 없음).
+			++CloseDone;
 		}
-		++CloseDone; ++Changes;
 	}
 
-	// 변경이 있으면 윈도우를 다시 그려 새 상태 반영(어둠 속 변화라 팝 안 보임).
-	if (Changes > 0)
-	{
-		const FIntPoint Center = (LastWindowCenter.X == MIN_int32) ? P : LastWindowCenter;
-		BuildWallsInWindow(Center, RenderRadiusCells);
-		LastWindowCenter = Center;
-	}
+	// 길 보장: 단절됐으면 어둠 속 벽을 열어 즉시 복구(연 벽 수 반환).
+	const int32 RepairedWalls = RepairConnectivityToGoal(P, CamLoc, CamFwd);
 
-	// [진단] 타이머가 도는지/후보가 잡히는지/디버그드로 켜짐 확인.
+	// [진단] 후보/적용 수 + 경로 진행도 + 복구 수.
 	if (GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(7777, ShiftInterval * 1.1f, FColor::Cyan,
-			FString::Printf(TEXT("ShiftTick: open=%d close=%d applied=%d draw=%d cell=(%d,%d)"),
-				OpenCands.Num(), CloseCands.Num(), Changes, bShiftDebugDraw ? 1 : 0, P.X, P.Y));
+			FString::Printf(TEXT("ShiftTick: open=%d/%d close=%d/%d repair=%d routeIdx=%d/%d cell=(%d,%d)"),
+				OpenDone, OpenCands.Num(), CloseDone, CloseCands.Num(), RepairedWalls, PlayerRouteIdx, RouteCells.Num(), P.X, P.Y));
 	}
 
-	// 관측 원뿔 시각화.
+	// 디버그 시각화(관측 원뿔 + 목표까지 경로선).
 	if (bShiftDebugDraw)
 	{
-		const float AngleRad = FMath::DegreesToRadians(ObserveConeAngle);
-		DrawDebugCone(World, CamLoc, CamFwd, ObserveRange, AngleRad, AngleRad, 16, FColor::Yellow, false, ShiftInterval * 1.1f, 0, 1.5f);
+		DrawShiftDebug(P, CamLoc, CamFwd);
 	}
+}
+
+FVector AMazeGenerator::EdgeMidWorld(FIntPoint A, FIntPoint B) const
+{
+	return (GetCellCenterWorld(A.X, A.Y) + GetCellCenterWorld(B.X, B.Y)) * 0.5f + FVector(0.f, 0.f, WallHeight * 0.5f);
+}
+
+void AMazeGenerator::EnsureShiftFlashlight(APawn* Pawn)
+{
+	// 손전등: 코드로 카메라에 1회 부착(BP 불필요). 원뿔/사거리는 관측 파라미터와 일치시켜 "빛=얼림"이 시각적으로 맞게 한다.
+	if (!bShiftFlashlight || Flashlight.IsValid() || !Pawn)
+	{
+		return;
+	}
+	UCameraComponent* Cam = Pawn->FindComponentByClass<UCameraComponent>();
+	if (!Cam)
+	{
+		return;
+	}
+	USpotLightComponent* Flash = NewObject<USpotLightComponent>(Pawn);
+	if (!Flash)
+	{
+		return;
+	}
+	Flash->SetMobility(EComponentMobility::Movable);
+	Flash->RegisterComponent();
+	Flash->AttachToComponent(Cam, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
+	Flash->SetRelativeLocationAndRotation(FVector::ZeroVector, FRotator::ZeroRotator);
+	Flash->SetAttenuationRadius(ObserveRange);
+	Flash->SetOuterConeAngle(ObserveConeAngle);
+	Flash->SetInnerConeAngle(FMath::Max(1.f, ObserveConeAngle * 0.6f));
+	Flash->SetIntensity(FlashlightIntensity);
+	Flash->SetCastShadows(true);
+	Flashlight = Flash;
+}
+
+int32 AMazeGenerator::RepairConnectivityToGoal(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd)
+{
+	// 닫기 가드(예방)를 넘어선 단절(플레이어가 닫히는 간선을 가로지르는 레이스 등)이 생기면, 어둠 속 벽을
+	// 우선 골라 여는 '최소-벽 경로'를 찾아 즉시 복구한다. 닫기는 연결을 만들 수 없으므로 복구는 '열기'로만.
+	// 복구 열기는 끊긴 두 컴포넌트를 잇는 것이라 루프도 만들지 않는다. (디버그와 무관하게 항상 호출.)
+	if (!bShiftGoalValid || IsCellReachable(PlayerCell, ShiftGoalCell))
+	{
+		return 0;
+	}
+
+	const int32 NumCells = GridWidth * GridHeight;
+	const int32 Start = Index(PlayerCell.X, PlayerCell.Y);
+	const int32 Target = Index(ShiftGoalCell.X, ShiftGoalCell.Y);
+
+	// Dijkstra(드물게만 실행): 간선 비용 = 열림 0 / 닫힘·어둠 1 / 닫힘·관측 OBS_COST(가능하면 안 건드림).
+	// 모든 셀쌍은 벽을 열어 통과 가능하므로 목표 도달은 항상 성공.
+	const int32 OBS_COST = 10000;
+	TArray<int32> Dist; Dist.Init(MAX_int32, NumCells);
+	TArray<int32> Prev; Prev.Init(INDEX_NONE, NumCells);
+	TBitArray<> Done(false, NumCells);
+	Dist[Start] = 0;
+	for (;;)
+	{
+		int32 Cur = INDEX_NONE, BestD = MAX_int32;
+		for (int32 i = 0; i < NumCells; ++i) { if (!Done[i] && Dist[i] < BestD) { BestD = Dist[i]; Cur = i; } }
+		if (Cur == INDEX_NONE || Cur == Target) { break; }
+		Done[Cur] = true;
+		const int32 X = Cur % GridWidth, Y = Cur / GridWidth;
+		const FIntPoint C(X, Y);
+		auto Relax = [&](int32 Ni, FIntPoint Nb)
+		{
+			int32 W = 0;
+			if (IsWallClosed(C, Nb))
+			{
+				W = IsPointObserved(EdgeMidWorld(C, Nb), CamLoc, CamFwd) ? OBS_COST : 1;
+			}
+			const int32 Nd = Dist[Cur] + W;
+			if (Nd < Dist[Ni]) { Dist[Ni] = Nd; Prev[Ni] = Cur; }
+		};
+		if (Y + 1 < GridHeight) { Relax(Cur + GridWidth, FIntPoint(X, Y + 1)); }
+		if (Y - 1 >= 0)         { Relax(Cur - GridWidth, FIntPoint(X, Y - 1)); }
+		if (X + 1 < GridWidth)  { Relax(Cur + 1,         FIntPoint(X + 1, Y)); }
+		if (X - 1 >= 0)         { Relax(Cur - 1,         FIntPoint(X - 1, Y)); }
+	}
+
+	// 경로 역추적: 닫힌 간선마다 '즉시' 데이터+물리 동시 개통(애니 없음 → 불일치 0초). 어둠 우선이라 보통 안 보임.
+	int32 Repaired = 0;
+	for (int32 Cur = Target; Cur != Start && Prev[Cur] != INDEX_NONE; Cur = Prev[Cur])
+	{
+		const int32 Pr = Prev[Cur];
+		const FIntPoint A(Cur % GridWidth, Cur / GridWidth);
+		const FIntPoint B(Pr % GridWidth, Pr / GridWidth);
+		if (!IsWallClosed(A, B)) { continue; } // 이미 열림.
+
+		const int64 K = EdgeKey(A, B);
+		// 이 간선에 진행 중이던 개폐 애니가 있으면 제거(즉시 개통이 우선 — 충돌/재닫힘 방지).
+		ActiveAnims.RemoveAll([&](const FWallAnim& An2)
+		{
+			return (An2.CellA == A && An2.CellB == B) || (An2.CellA == B && An2.CellB == A);
+		});
+		if (K >= 0) { AnimatedEdges.Remove(K); }
+
+		// 인스턴스를 즉시 바닥 아래로 숨긴다(RiseFall O=1 위치) → 데이터 개통과 동시에 물리 벽도 사라짐.
+		int32 Idx = INDEX_NONE, X, Y, S;
+		if (WallISM && FindWallInstance(A, B, Idx) && EdgeOwner(A, B, X, Y, S))
+		{
+			FQuat R; FVector Sc, Ce, Bo;
+			if (ComputeWallGeom(X, Y, S, R, Sc, Ce, Bo))
+			{
+				const FVector GoneCenter = Ce + FVector(0.f, 0.f, -(WallHeight + 50.f));
+				const FVector Loc = GoneCenter - R.RotateVector(Bo);
+				WallISM->UpdateInstanceTransform(Idx, FTransform(R, Loc, Sc), false, true, true);
+			}
+			if (K >= 0) { WallInstanceIndex.Remove(K); }
+			FreedWallPool.Add(Idx); // 미래 닫기에서 재사용.
+		}
+		ClearWallBetween(A, B); // 데이터 개통.
+		++Repaired;
+	}
+	return Repaired;
+}
+
+void AMazeGenerator::DrawShiftDebug(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd) const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// 관측 원뿔.
+	const float AngleRad = FMath::DegreesToRadians(ObserveConeAngle);
+	DrawDebugCone(World, CamLoc, CamFwd, ObserveRange, AngleRad, AngleRad, 16, FColor::Yellow, false, ShiftInterval * 1.1f, 0, 1.5f);
+
+	// 목표까지 길이 항상 존재함을 시각 확인: 현재 열린 그래프에서 플레이어→목표 BFS 경로선(청록).
+	if (!bShiftGoalValid)
+	{
+		return;
+	}
+	const int32 NumCells = GridWidth * GridHeight;
+	TArray<int32> Parent;
+	Parent.Init(INDEX_NONE, NumCells);
+	TArray<int32> Queue;
+	Queue.Reserve(NumCells);
+	const int32 Start = Index(PlayerCell.X, PlayerCell.Y);
+	const int32 Target = Index(ShiftGoalCell.X, ShiftGoalCell.Y);
+	Parent[Start] = Start;
+	Queue.Add(Start);
+	int32 Head = 0;
+	while (Head < Queue.Num())
+	{
+		const int32 Cur = Queue[Head++];
+		if (Cur == Target) { break; }
+		const int32 X = Cur % GridWidth;
+		const int32 Y = Cur / GridWidth;
+		const uint8 W = Cells[Cur];
+		if (!(W & Wall_North) && Y + 1 < GridHeight) { const int32 Ni = Cur + GridWidth; if (Parent[Ni] == INDEX_NONE) { Parent[Ni] = Cur; Queue.Add(Ni); } }
+		if (!(W & Wall_South) && Y - 1 >= 0)         { const int32 Ni = Cur - GridWidth; if (Parent[Ni] == INDEX_NONE) { Parent[Ni] = Cur; Queue.Add(Ni); } }
+		if (!(W & Wall_East)  && X + 1 < GridWidth)  { const int32 Ni = Cur + 1;         if (Parent[Ni] == INDEX_NONE) { Parent[Ni] = Cur; Queue.Add(Ni); } }
+		if (!(W & Wall_West)  && X - 1 >= 0)         { const int32 Ni = Cur - 1;         if (Parent[Ni] == INDEX_NONE) { Parent[Ni] = Cur; Queue.Add(Ni); } }
+	}
+	const float PathZ = WallHeight * 0.5f;
+	if (Parent[Target] != INDEX_NONE)
+	{
+		for (int32 Cur = Target; Cur != Start; Cur = Parent[Cur])
+		{
+			const int32 Pr = Parent[Cur];
+			const FVector A0 = GetCellCenterWorld(Cur % GridWidth, Cur / GridWidth) + FVector(0, 0, PathZ);
+			const FVector B0 = GetCellCenterWorld(Pr % GridWidth, Pr / GridWidth) + FVector(0, 0, PathZ);
+			DrawDebugLine(World, A0, B0, FColor::Cyan, false, ShiftInterval * 1.1f, 0, 8.f);
+		}
+	}
+	else if (GEngine)
+	{
+		// 가드/복구가 정상이면 여기 오면 안 됨 — 오면 길이 끊긴 것이므로 경고.
+		GEngine->AddOnScreenDebugMessage(7778, ShiftInterval * 1.1f, FColor::Red, TEXT("WARNING: no path player->goal!"));
+	}
+}
+
+void AMazeGenerator::InitShiftRun()
+{
+	// 플레이어 시작 셀 → 목표 셀(ShiftGoalCell)까지의 단조 staircase 경로를 만든다(피날레 경로 산출과 동형).
+	// 이 경로가 시프트의 '척추' — 앞쪽 경로 간선을 열고(전진 유도), 지나온 경로 셀의 옆 간선을 닫는다(백트래킹 봉인).
+	bShiftActive = true;
+
+	RouteCells.Reset();
+	RouteEdgeSet.Reset();
+	AnimatedEdges.Reset();
+	ActiveAnims.Reset();
+	FreedWallPool.Reset();
+	OpenedWallCount = 0;
+	FinaleStream = FRandomStream(Seed ^ 0x2545F491); // 개폐 방식(Slide/SwingDoor) 선택용.
+
+	const FIntPoint Start = GetPlayerCell();
+	const FIntPoint Goal = bShiftGoalValid ? ShiftGoalCell : FIntPoint(GridWidth - 1, GridHeight - 1);
+
+	FRandomStream Stream(Seed ^ 0x5BD1E995);
+	FIntPoint Cur = Start;
+	RouteCells.Add(Cur);
+	int32 Guard = (GridWidth + GridHeight) * 2 + 4;
+	while (Cur != Goal && Guard-- > 0)
+	{
+		const int32 DX = Goal.X - Cur.X;
+		const int32 DY = Goal.Y - Cur.Y;
+		const bool bCanX = DX != 0;
+		const bool bCanY = DY != 0;
+		const bool bMoveX = (bCanX && bCanY) ? (Stream.FRand() < 0.5f) : bCanX;
+		if (bMoveX) { Cur.X += (DX > 0) ? 1 : -1; }
+		else        { Cur.Y += (DY > 0) ? 1 : -1; }
+		RouteCells.Add(Cur);
+	}
+
+	// 경로 간선 집합 — 이 벽들은 절대 닫지 않는다(플레이어→목표 항상 풀림).
+	for (int32 i = 0; i + 1 < RouteCells.Num(); ++i)
+	{
+		const int64 K = EdgeKey(RouteCells[i], RouteCells[i + 1]);
+		if (K >= 0) { RouteEdgeSet.Add(K); }
+	}
+
+	SetActorTickEnabled(true); // Tick이 개폐 애니(ActiveAnims)를 매 프레임 구동.
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: ShiftRun init — route %d cells, start(%d,%d)→goal(%d,%d)."),
+		RouteCells.Num(), Start.X, Start.Y, Goal.X, Goal.Y);
+}
+
+bool AMazeGenerator::WallWouldHitPlayer(FIntPoint C, FIntPoint N, const FVector& PlayerLoc) const
+{
+	// 솟아오르는 닫기 벽이 플레이어 캡슐과 겹치면 CharacterMovement depenetration이 플레이어를 밀어낸다.
+	// 벽 footprint(셀 경계 슬랩) 중심 기준 across(법선)·along(길이축) 거리로 캡슐 겹침을 근사 판정.
+	const float PlayerRadius = 55.f; // 1인칭 템플릿 캡슐 반경(34) + 여유.
+	const FVector Fc = (GetCellCenterWorld(C.X, C.Y) + GetCellCenterWorld(N.X, N.Y)) * 0.5f; // 벽 footprint 중심(경계).
+	const FVector AcrossN = FVector(static_cast<float>(N.X - C.X), static_cast<float>(N.Y - C.Y), 0.f).GetSafeNormal(); // 경계 법선.
+	const FVector Rel2D(PlayerLoc.X - Fc.X, PlayerLoc.Y - Fc.Y, 0.f);
+	const float DistAcross = FMath::Abs(FVector::DotProduct(Rel2D, AcrossN));        // 슬랩 면까지 수직 거리.
+	const float DistAlong = (Rel2D - AcrossN * FVector::DotProduct(Rel2D, AcrossN)).Size(); // 벽 길이축 거리.
+	return DistAcross < (WallThickness * 0.5f + PlayerRadius + 8.f)
+		&& DistAlong < (CellSize * 0.5f + PlayerRadius);
 }
 
 int64 AMazeGenerator::EncodeWallKey(int32 X, int32 Y, int32 Side) const
@@ -1079,8 +1334,19 @@ void AMazeGenerator::ScheduleOpenEdge(FIntPoint A, FIntPoint B, EWallAnimStyle S
 	An.bOpening = true;
 	An.CellA = A;
 	An.CellB = B;
-	// 길을 막지 않게 안착할 비경로 빈 슬롯을 정함(슬라이드/문 불가 시 RiseFall=바닥으로 꺼짐).
-	An.Style = ResolveAnimStyle(A, B, Style, An.SlideDir, An.PivotOffset, An.SwingSign, An.RestSlotA, An.RestSlotB);
+	if (bShiftActive)
+	{
+		// 시프트 모드: 열린 벽은 옆 슬롯에 '주차'하지 않고 바닥으로 가라앉아 완전히 사라진다.
+		// (주차는 데이터-개방 슬롯에 벽 인스턴스를 남겨 "경로는 열렸는데 벽이 막는" 데이터/물리 불일치를 만든다.)
+		An.Style = EWallAnimStyle::RiseFall;
+		An.RestSlotA = FIntPoint(-1, -1);
+		An.RestSlotB = FIntPoint(-1, -1);
+	}
+	else
+	{
+		// 피날레: 길을 막지 않게 안착할 비경로 빈 슬롯을 정함(슬라이드/문 불가 시 RiseFall=바닥으로 꺼짐).
+		An.Style = ResolveAnimStyle(A, B, Style, An.SlideDir, An.PivotOffset, An.SwingSign, An.RestSlotA, An.RestSlotB);
+	}
 	ActiveAnims.Add(An);
 	AnimatedEdges.Add(Key);
 
@@ -1346,21 +1612,30 @@ void AMazeGenerator::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
-	if (!bFinaleActive || !WallISM)
+	// 피날레(거리 기반 길 열기/닫기) 또는 시프트(관측 기반, ShiftTick이 예약) — 둘 다 개폐 애니를 Tick에서 구동.
+	if ((!bFinaleActive && !bShiftActive) || !WallISM)
 	{
 		return;
 	}
 
-	// 플레이어 현재 월드 위치.
+	// 플레이어 현재 월드 위치 + (시프트용) 카메라 관측 시점.
 	FVector PlayerLoc = GetActorLocation();
+	FVector CamLoc = PlayerLoc;
+	FVector CamFwd = FVector::ForwardVector;
 	if (const APlayerController* PC = GetWorld()->GetFirstPlayerController())
 	{
 		if (const APawn* Pawn = PC->GetPawn())
 		{
 			PlayerLoc = Pawn->GetActorLocation();
 		}
+		FRotator CamRot;
+		PC->GetPlayerViewPoint(CamLoc, CamRot);
+		CamFwd = CamRot.Vector();
 	}
 
+	// 피날레 전용: 거리 기반 경로 구간 열기 + 옆 통로 닫기. (시프트 모드의 개폐 예약은 ShiftTick에서 관측 기반으로 한다.)
+	if (bFinaleActive)
+	{
 	bool bAnyChangeThisFrame = false;
 
 	// (1) 경로 구간 열기: 부모 구간이 열렸고 플레이어가 구간 시작에 근접 → 그 구간 벽들을 '열기'(치움).
@@ -1386,20 +1661,7 @@ void AMazeGenerator::Tick(float DeltaSeconds)
 	// (2) 경로 아닌 옆 통로 닫기: 플레이어가 경로 셀에 근접하면 그 셀의 '경로 아닌' 열린 옆면에 벽을 새로 생성.
 	const FIntPoint Dirs4[4] = { FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1) };
 
-	// 솟아오르는 벽이 플레이어 캡슐과 겹치면 CharacterMovement의 depenetration이 플레이어를 밀어낸다.
-	// → 벽 footprint(셀 경계 슬랩)가 플레이어와 겹치면 이번 프레임엔 닫지 않고 다음 프레임에 재시도(밀림 방지).
-	const float PlayerRadius = 55.f; // 1인칭 템플릿 캡슐 반경(34) + 여유. (헤더/Include 회피용 상수.)
-	auto WallWouldHitPlayer = [&](const FIntPoint& C, const FIntPoint& N) -> bool
-	{
-		const FVector Fc = (GetCellCenterWorld(C.X, C.Y) + GetCellCenterWorld(N.X, N.Y)) * 0.5f; // 벽 footprint 중심(경계).
-		const FVector AcrossN = FVector(static_cast<float>(N.X - C.X), static_cast<float>(N.Y - C.Y), 0.f).GetSafeNormal(); // 경계 법선(두께 방향).
-		const FVector Rel2D(PlayerLoc.X - Fc.X, PlayerLoc.Y - Fc.Y, 0.f);
-		const float DistAcross = FMath::Abs(FVector::DotProduct(Rel2D, AcrossN));        // 슬랩 면까지 수직 거리.
-		const float DistAlong = (Rel2D - AcrossN * FVector::DotProduct(Rel2D, AcrossN)).Size(); // 벽 길이축 거리.
-		return DistAcross < (WallThickness * 0.5f + PlayerRadius + 8.f)
-			&& DistAlong < (CellSize * 0.5f + PlayerRadius);
-	};
-
+	// 솟아오르는 벽이 플레이어 캡슐과 겹치면 밀려나므로, 겹치면 다음 프레임에 재시도(WallWouldHitPlayer, 멤버 함수).
 	for (int32 i = 0; i < RouteCells.Num(); ++i)
 	{
 		if (RouteCellClosed[i])
@@ -1437,7 +1699,7 @@ void AMazeGenerator::Tick(float DeltaSeconds)
 			{
 				continue; // 경로 벽은 닫지 않음.
 			}
-			if (WallWouldHitPlayer(C, N))
+			if (WallWouldHitPlayer(C, N, PlayerLoc))
 			{
 				bAllDone = false; // 플레이어와 겹침 → 밀림 방지를 위해 다음 프레임에 재시도.
 				continue;
@@ -1452,13 +1714,33 @@ void AMazeGenerator::Tick(float DeltaSeconds)
 
 	// 벽 열림/닫힘에는 흔들림 없음(잡힐 때만 흔들림 — HandlePlayerCaught).
 	(void)bAnyChangeThisFrame;
+	} // end if (bFinaleActive)
 
-	// (3) 진행 중 개폐 애니 갱신.
+	// (3) 진행 중 개폐 애니 갱신(피날레·시프트 공용).
 	const float Dur = FMath::Max(0.05f, WallSlideDuration);
 	for (int32 i = ActiveAnims.Num() - 1; i >= 0; --i)
 	{
 		FWallAnim& An = ActiveAnims[i];
-		An.Elapsed += DeltaSeconds;
+
+		// 시프트 모드: 관측(빛/시야) 중인 벽은 개폐를 진행하지 않는다(관측=얼림).
+		// - 열기: 관측이면 그 자리에서 멈춤(Elapsed 유지).
+		// - 닫기: 관측이면 바닥으로 되사라져 '완전히 열린 채' 대기(Elapsed→0). 어둠이 되면 다시 솟음.
+		// 어둠일 때만 정상 진행 → 완료 분기는 Alpha>=1일 때만이라 관측 중엔 절대 완료되지 않음.
+		bool bObserved = false;
+		if (bShiftActive)
+		{
+			bObserved = IsPointObserved(EdgeMidWorld(An.CellA, An.CellB), CamLoc, CamFwd);
+		}
+		if (!bObserved)
+		{
+			An.Elapsed += DeltaSeconds;
+		}
+		else if (!An.bOpening)
+		{
+			An.Elapsed = FMath::Max(0.f, An.Elapsed - DeltaSeconds); // 닫기: 관측 중엔 되사라짐.
+		}
+		// (열기 + 관측: Elapsed 유지 = 멈춤.)
+
 		const float Alpha = FMath::Clamp(An.Elapsed / Dur, 0.f, 1.f);
 		const float Open = An.bOpening ? Alpha : (1.f - Alpha); // 0=제자리, 1=사라짐.
 
