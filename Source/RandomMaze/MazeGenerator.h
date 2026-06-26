@@ -16,6 +16,7 @@ class AMazeChaser;
 class USpotLightComponent;
 class UCameraComponent;
 class APawn;
+class UMaterialParameterCollection;
 
 /**
  * 시드 기반 결정론적 랜덤 미로 생성기 (Phase 1).
@@ -204,6 +205,28 @@ public:
 	/** 손전등 밝기. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
 	float FlashlightIntensity = 5000.f;
+
+	// --- 월드 커브(인셉션식 곡면) — 멀리 있는 벽/랜드마크가 위로 휘어 보여 방향감을 준다(시각만, 충돌 무관) ---
+
+	/** 켜면 시프트 시작 시 곡률(MPC Curvature)을 적용한다. 휨은 머티리얼 WPO가 담당(충돌/이동은 평면 유지). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	bool bWorldCurve = true;
+
+	/** 곡률 강도. 멀리 있는 정점 Z 상승량 = CurveStrength × (카메라 수평거리)². 클수록 더 휨. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve", meta = (ClampMin = "0.0"))
+	float CurveStrength = 0.0005f;
+
+	/** 곡률 스칼라 'Curvature'를 담은 Material Parameter Collection(에디터에서 MPC_Curve 지정). 비우면 곡률 미적용. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	TObjectPtr<UMaterialParameterCollection> CurveMPC;
+
+	/** 켜면 목표 셀에 발광 비콘을 스폰(어둠 속에서도 멀리 휘어 보이는 목표 마커). 선택. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	bool bSpawnGoalBeacon = false;
+
+	/** 발광 비콘으로 스폰할 액터 클래스(키 큰 emissive 메시 권장). bSpawnGoalBeacon이 켜져 있고 지정됐을 때만. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	TSubclassOf<AActor> GoalBeaconClass;
 
 	/** 미로 데이터를 (재)생성한다(렌더는 윈도우가 담당). 디테일 패널 버튼 또는 BP에서 호출 가능. */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Maze")

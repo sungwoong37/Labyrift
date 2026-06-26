@@ -16,6 +16,8 @@
 #include "GameFramework/PlayerController.h"
 #include "FinaleCameraShake.h"
 #include "GoalPoint.h"
+#include "Kismet/KismetMaterialLibrary.h"
+#include "Materials/MaterialParameterCollection.h"
 #include "Math/RandomStream.h"
 #include "MazeChaser.h"
 #include "MazeExit.h"
@@ -103,6 +105,23 @@ void AMazeGenerator::BeginPlay()
 			World->GetTimerManager().SetTimer(ShiftTimer, this, &AMazeGenerator::ShiftTick, ShiftInterval, /*bLoop=*/true);
 			UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: ShiftMode ON, timer=%.2fs, goal=(%d,%d)."), ShiftInterval, ShiftGoalCell.X, ShiftGoalCell.Y);
 			if (GEngine) { GEngine->AddOnScreenDebugMessage(-1, 8.f, FColor::Green, TEXT("ShiftMode ON (timer started)")); }
+
+			// 월드 커브: 머티리얼 WPO가 읽는 MPC 'Curvature'에 곡률을 주입(휨은 시각만, 충돌/이동은 평면).
+			if (bWorldCurve && CurveMPC)
+			{
+				UKismetMaterialLibrary::SetScalarParameterValue(World, CurveMPC, TEXT("Curvature"), CurveStrength);
+				UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: WorldCurve ON, Curvature=%.5f."), CurveStrength);
+			}
+
+			// 선택: 목표 셀에 발광 비콘(어둠 속에서도 멀리 휘어 보이는 목표 마커).
+			if (bSpawnGoalBeacon && GoalBeaconClass)
+			{
+				FActorSpawnParameters BParams;
+				BParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+				const FVector BeaconLoc = GetCellCenterWorld(ShiftGoalCell.X, ShiftGoalCell.Y);
+				World->SpawnActor<AActor>(GoalBeaconClass, BeaconLoc, GetActorRotation(), BParams);
+			}
+
 			return; // 시프트 모드에선 윈도우 타이머/피날레 구독을 쓰지 않는다(인덱스 보존 + 충돌 방지).
 		}
 
