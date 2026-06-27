@@ -5,10 +5,12 @@
 
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
+#include "Components/ExponentialHeightFogComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SpotLightComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
+#include "Engine/ExponentialHeightFog.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -112,6 +114,9 @@ void AMazeGenerator::BeginPlay()
 				UKismetMaterialLibrary::SetScalarParameterValue(World, CurveMPC, TEXT("Curvature"), CurveStrength);
 				UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: WorldCurve ON, Curvature=%.5f."), CurveStrength);
 			}
+
+			// 시프트 안개: 천장 부재(하늘)와 X방향 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다.
+			EnsureShiftFog();
 
 			// 선택: 목표 셀에 발광 비콘(어둠 속에서도 멀리 휘어 보이는 목표 마커).
 			if (bSpawnGoalBeacon && GoalBeaconClass)
@@ -871,6 +876,49 @@ void AMazeGenerator::EnsureShiftFlashlight(APawn* Pawn)
 	Flash->SetIntensity(FlashlightIntensity);
 	Flash->SetCastShadows(true);
 	Flashlight = Flash;
+}
+
+void AMazeGenerator::EnsureShiftFog()
+{
+	// 안개: 코드로 ExponentialHeightFog를 1회 스폰(BP 불필요). 손전등과 짝이 되어 어둠 속 시야를 반경 안에 가둔다.
+	// 천장(Z): FogHeightFalloff를 작게 줘 위쪽까지 안개가 고르게 차오르고, 하늘(무한 거리)은 MaxOpacity로 완전히 덮인다.
+	// 수평(X/Y): 안개가 거리 비례로 누적되므로 StartDistance 너머 먼 벽이 자연스럽게 페이드된다.
+	UWorld* World = GetWorld();
+	if (!bShiftFog || ShiftFog.IsValid() || !World)
+	{
+		return;
+	}
+	// UE는 씬당 ExponentialHeightFog를 사실상 하나만 렌더에 쓴다 → 레벨에 이미 있으면 그걸 조정해야
+	// 한다(추가 스폰하면 기존 것에 가려 무시됨). 있으면 재사용, 없을 때만 새로 스폰.
+	AExponentialHeightFog* Fog = nullptr;
+	for (TActorIterator<AExponentialHeightFog> It(World); It; ++It) { Fog = *It; break; }
+	if (!Fog)
+	{
+		FActorSpawnParameters Params;
+		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		// 안개 레이어 기준 높이 = 벽 중간. 위/아래로 고르게 덮이도록(충돌 없음, 시각만).
+		const FVector FogLoc = GetActorLocation() + FVector(0.f, 0.f, WallHeight * 0.5f);
+		Fog = World->SpawnActor<AExponentialHeightFog>(
+			AExponentialHeightFog::StaticClass(), FogLoc, FRotator::ZeroRotator, Params);
+	}
+	if (!Fog)
+	{
+		return;
+	}
+	if (UExponentialHeightFogComponent* C = Fog->GetComponent())
+	{
+		// 모든 파라미터는 디테일 패널 'Maze|Fog'에서 조정 가능(여기선 그 값을 적용만).
+		C->SetFogDensity(FogDensity);
+		C->SetFogHeightFalloff(FogHeightFalloff);
+		C->SetFogInscatteringColor(FogColor);
+		C->SetStartDistance(FogStartDistance);
+		C->SetFogMaxOpacity(FogMaxOpacity);
+		// 방향성 산란(태양빛 줄무늬) 제거 — 어둠 분위기 유지.
+		C->SetDirectionalInscatteringColor(FLinearColor::Black);
+	}
+	ShiftFog = Fog;
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: ShiftFog ready (density=%.3f falloff=%.3f start=%.0f color=(%.3f,%.3f,%.3f))."),
+		FogDensity, FogHeightFalloff, FogStartDistance, FogColor.R, FogColor.G, FogColor.B);
 }
 
 int32 AMazeGenerator::RepairConnectivityToGoal(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd)

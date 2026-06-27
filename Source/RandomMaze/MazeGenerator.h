@@ -228,6 +228,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	TSubclassOf<AActor> GoalBeaconClass;
 
+	// --- 시프트 안개 — ExponentialHeightFog를 코드로 스폰해 '천장(위쪽 빈 공간)'과 'X방향 먼 거리'를 함께 정리 ---
+
+	/** 켜면 시프트 시작 시 ExponentialHeightFog를 코드로 스폰한다. 천장 부재(하늘)와 수평 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
+	bool bShiftFog = true;
+
+	/** 안개 밀도. 클수록 짙어 가까이서 페이드. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
+	float FogDensity = 0.05f;
+
+	/** 높이 감쇠. 작을수록 위쪽(천장 방향)까지 안개가 고르게 차올라 천장 부재를 가린다(천장 정리엔 0.01 이하 권장). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
+	float FogHeightFalloff = 0.005f;
+
+	/** 안개 시작 수평 거리(cm). 이 거리 너머부터 안개가 짙어져 X방향 먼 벽을 정리한다(손전등 사거리 근처 권장). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
+	float FogStartDistance = 600.f;
+
+	/** 안개 색(어둠 분위기). 천장/먼 거리가 이 색으로 채워진다. 너무 어두우면(거의 검정) 어두운 씬에서 안 보이니 식별 가능한 회색 권장. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
+	FLinearColor FogColor = FLinearColor(0.08f, 0.08f, 0.10f, 1.f);
+
+	/** 안개 최대 불투명도(1=완전히 가림). 천장(무한 거리 하늘)을 확실히 덮으려면 1 권장. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float FogMaxOpacity = 1.f;
+
 	/** 미로 데이터를 (재)생성한다(렌더는 윈도우가 담당). 디테일 패널 버튼 또는 BP에서 호출 가능. */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Maze")
 	void GenerateMaze();
@@ -478,6 +504,9 @@ private:
 	/** 코드로 플레이어 카메라에 부착한 손전등(시프트 모드 어둠 동행). */
 	TWeakObjectPtr<USpotLightComponent> Flashlight;
 
+	/** 코드로 스폰한 시프트 안개(천장/수평 먼 거리 정리). */
+	TWeakObjectPtr<class AExponentialHeightFog> ShiftFog;
+
 	/** 시프트 경로(플레이어 시작→목표) + 렌더가 준비되어 Tick이 개폐 애니를 구동하는 상태. */
 	bool bShiftActive = false;
 
@@ -489,6 +518,9 @@ private:
 
 	/** 시프트 모드: 플레이어 카메라에 손전등(스포트라이트)을 코드로 1회 부착(관측 파라미터와 원뿔/사거리 일치). */
 	void EnsureShiftFlashlight(APawn* Pawn);
+
+	/** 시프트 모드: ExponentialHeightFog를 코드로 1회 스폰(천장 부재 + X방향 먼 벽을 안개로 정리). */
+	void EnsureShiftFog();
 
 	/** 어떤 경우에도 플레이어→목표 길을 보장: 단절 시 어둠 우선 최소-벽 경로(Dijkstra)를 찾아 즉시 개통. 연 벽 수 반환. */
 	int32 RepairConnectivityToGoal(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd);
