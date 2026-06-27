@@ -19,6 +19,7 @@
 #include "FinaleCameraShake.h"
 #include "GoalPoint.h"
 #include "Kismet/KismetMaterialLibrary.h"
+#include "Materials/MaterialInterface.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Math/RandomStream.h"
 #include "MazeChaser.h"
@@ -55,6 +56,18 @@ AMazeGenerator::AMazeGenerator()
 	if (CubeMesh.Succeeded())
 	{
 		WallStaticMesh = CubeMesh.Object;
+	}
+
+	// 바닥 타일 ISM(시프트 모드 휘는 바닥). 충돌은 숨긴 레벨 바닥이 담당 → 여기선 시각만(NoCollision).
+	FloorISM = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("FloorISM"));
+	FloorISM->SetupAttachment(WallISM);
+	FloorISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	// 기본 바닥 메시 = 엔진 Plane(정점 4개라 타일마다 통째로 기울어 곡면 근사).
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> PlaneMesh(TEXT("/Engine/BasicShapes/Plane.Plane"));
+	if (PlaneMesh.Succeeded())
+	{
+		FloorStaticMesh = PlaneMesh.Object;
 	}
 }
 
@@ -117,6 +130,16 @@ void AMazeGenerator::BeginPlay()
 
 			// 시프트 안개: 천장 부재(하늘)와 X방향 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다.
 			EnsureShiftFog();
+
+			// 휘는 바닥: 셀 타일 ISM을 깔고 레벨 평면 바닥을 숨긴다(커브는 벽과 같은 머티리얼 WPO가 담당, 충돌은 숨긴 바닥 유지).
+			if (bShiftCurvedFloor)
+			{
+				BuildFloorInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
+				if (FloorActorToHide)
+				{
+					FloorActorToHide->SetActorHiddenInGame(true);
+				}
+			}
 
 			// 선택: 목표 셀에 발광 비콘(어둠 속에서도 멀리 휘어 보이는 목표 마커).
 			if (bSpawnGoalBeacon && GoalBeaconClass)
@@ -279,6 +302,10 @@ void AMazeGenerator::ClearMaze()
 	if (WallISM)
 	{
 		WallISM->ClearInstances();
+	}
+	if (FloorISM)
+	{
+		FloorISM->ClearInstances();
 	}
 }
 
@@ -548,6 +575,61 @@ void AMazeGenerator::BuildWallsInWindow(FIntPoint Center, int32 Radius)
 
 	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: %dx%d (%lld cells), 윈도우[%d..%d, %d..%d], %d wall instances."),
 		GridWidth, GridHeight, static_cast<int64>(GridWidth) * GridHeight, MinX, MaxX, MinY, MaxY, WallISM->GetInstanceCount());
+}
+
+void AMazeGenerator::BuildFloorInWindow(FIntPoint Center, int32 Radius)
+{
+	if (!FloorISM || !FloorStaticMesh)
+	{
+		return;
+	}
+	FloorISM->SetStaticMesh(FloorStaticMesh);
+	if (FloorMaterial)
+	{
+		FloorISM->SetMaterial(0, FloorMaterial);
+	}
+	FloorISM->ClearInstances();
+
+	// 평면 메시 바운드 → 셀 크기에 맞춘 균일 스케일(Plane 피벗은 중앙이라 셀 중심에 그대로 놓는다).
+	const FBoxSphereBounds B = FloorStaticMesh->GetBounds();
+	const float MeshX = B.BoxExtent.X * 2.f;
+	const float MeshY = B.BoxExtent.Y * 2.f;
+	const FVector FloorScale(
+		(MeshX > KINDA_SMALL_NUMBER) ? CellSize / MeshX : 1.f,
+		(MeshY > KINDA_SMALL_NUMBER) ? CellSize / MeshY : 1.f,
+		1.f);
+
+	const int32 MinX = FMath::Clamp(Center.X - Radius, 0, GridWidth - 1);
+	const int32 MaxX = FMath::Clamp(Center.X + Radius, 0, GridWidth - 1);
+	const int32 MinY = FMath::Clamp(Center.Y - Radius, 0, GridHeight - 1);
+	const int32 MaxY = FMath::Clamp(Center.Y + Radius, 0, GridHeight - 1);
+
+	TArray<FTransform> Transforms;
+	Transforms.Reserve((MaxX - MinX + 1) * (MaxY - MinY + 1));
+	for (int32 Y = MinY; Y <= MaxY; ++Y)
+	{
+		for (int32 X = MinX; X <= MaxX; ++X)
+		{
+			// 셀 중심, 바닥면 Z=0. 휨은 머티리얼 WPO가 담당(여기선 평면 타일만 배치).
+			Transforms.Emplace(FQuat::Identity, FVector(X * CellSize, Y * CellSize, 0.f), FloorScale);
+		}
+	}
+	if (Transforms.Num() > 0)
+	{
+		FloorISM->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/false);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: 바닥 타일 %d개 mesh=%s material=%s hide=%s."),
+		FloorISM->GetInstanceCount(),
+		*FloorStaticMesh->GetName(),
+		FloorMaterial ? *FloorMaterial->GetName() : TEXT("(none→메시기본=평평)"),
+		FloorActorToHide ? *FloorActorToHide->GetName() : TEXT("(none)"));
+
+	// [FloorDiag] 휨이 안 보이는 원인 격리: 실제 적용된 머티리얼(SetMaterial 반영) + 곡률 주입값(벽과 공유 MPC).
+	UMaterialInterface* AppliedMat = FloorISM->GetMaterial(0);
+	float CurMpc = -999.f;
+	if (CurveMPC) { CurMpc = UKismetMaterialLibrary::GetScalarParameterValue(GetWorld(), CurveMPC, TEXT("Curvature")); }
+	UE_LOG(LogTemp, Warning, TEXT("[FloorDiag] appliedMat(slot0)=%s MPC.Curvature=%.5f CurveStrength=%.5f bWorldCurve=%d"),
+		AppliedMat ? *AppliedMat->GetName() : TEXT("null"), CurMpc, CurveStrength, bWorldCurve ? 1 : 0);
 }
 
 void AMazeGenerator::UpdateRenderWindow()

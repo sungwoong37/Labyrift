@@ -17,6 +17,7 @@ class USpotLightComponent;
 class UCameraComponent;
 class APawn;
 class UMaterialParameterCollection;
+class UMaterialInterface;
 
 /**
  * 시드 기반 결정론적 랜덤 미로 생성기 (Phase 1).
@@ -228,6 +229,24 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	TSubclassOf<AActor> GoalBeaconClass;
 
+	// --- 휘는 바닥(시프트 모드) — 레벨 평면 바닥은 정점 4개라 WPO로 안 휘므로, 셀 단위 타일 ISM으로 깔아 같은 커브 머티리얼 적용 ---
+
+	/** 켜면 시프트 모드에서 셀마다 바닥 타일(ISM)을 깔아 벽과 같은 커브 머티리얼로 휘게 한다(멀리 타일일수록 들려 곡면 근사). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	bool bShiftCurvedFloor = true;
+
+	/** 바닥 타일에 쓸 평면 메시(기본 엔진 Plane). 셀 크기에 맞춰 균일 스케일된다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	TObjectPtr<UStaticMesh> FloorStaticMesh;
+
+	/** 바닥 타일 머티리얼. 벽과 같은 커브 WPO 머티리얼을 지정하면 휜다. 비우면 메시 기본 머티리얼(평평). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	TObjectPtr<UMaterialInterface> FloorMaterial;
+
+	/** 시프트 시작 시 숨길 레벨의 평평한 바닥 액터(Floor_0 등). 휘는 타일과 겹치지 않도록. 충돌은 유지(시각만 숨김 → 평면 위를 걷는다). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	TObjectPtr<AActor> FloorActorToHide;
+
 	// --- 시프트 안개 — ExponentialHeightFog를 코드로 스폰해 '천장(위쪽 빈 공간)'과 'X방향 먼 거리'를 함께 정리 ---
 
 	/** 켜면 시프트 시작 시 ExponentialHeightFog를 코드로 스폰한다. 천장 부재(하늘)와 수평 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다. */
@@ -288,6 +307,10 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
 	TObjectPtr<UInstancedStaticMeshComponent> WallISM;
 
+	/** 바닥 타일 인스턴싱용 ISM(시프트 모드 휘는 바닥). 충돌 없음 — 충돌은 숨긴 레벨 바닥이 담당. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UInstancedStaticMeshComponent> FloorISM;
+
 private:
 	/** 셀별 벽 비트마스크 저장 (크기 = GridWidth * GridHeight). */
 	TArray<uint8> Cells;
@@ -312,6 +335,9 @@ private:
 	/** Center 셀 기준 ±Radius 윈도우 안의 벽만 HISM 인스턴스로 배치한다(기존 인스턴스는 교체).
 	 *  bRecordInstanceMap이 켜져 있으면 (X,Y,Side)→인스턴스 인덱스를 WallInstanceIndex에 기록한다. */
 	void BuildWallsInWindow(FIntPoint Center, int32 Radius);
+
+	/** Center 셀 기준 ±Radius 윈도우 안의 셀마다 바닥 타일을 FloorISM에 깐다(시프트 모드 휘는 바닥). */
+	void BuildFloorInWindow(FIntPoint Center, int32 Radius);
 
 	/** 런타임: 플레이어 위치를 셀로 변환해 윈도우 중심이 바뀌었으면 다시 렌더한다. */
 	void UpdateRenderWindow();
