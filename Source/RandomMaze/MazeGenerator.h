@@ -213,11 +213,16 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	bool bWorldCurve = true;
 
-	/** 곡률 강도. 멀리 있는 정점 Z 상승량 = CurveStrength × (카메라 수평거리)². 클수록 더 휨. */
+	/** 곡률 강도(rad/cm). 정점을 카메라 Y축 둘레로 θ = (Y거리 − CurveStartDist) × CurveStrength 만큼 회전.
+	 *  클수록 급하게 말려 올라간다. 시프트 사이클마다 재주입 → PIE 중 수정 즉시 반영. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve", meta = (ClampMin = "0.0"))
-	float CurveStrength = 0.0005f;
+	float CurveStrength = 0.00004f;
 
-	/** 곡률 스칼라 'Curvature'를 담은 Material Parameter Collection(에디터에서 MPC_Curve 지정). 비우면 곡률 미적용. */
+	/** 플레이어 근처 이 Y거리(cm) 안은 완전 평지, 그 밖부터 휘기 시작. MPC 'CurveStartDist'로 주입. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve", meta = (ClampMin = "0.0"))
+	float CurveStartDist = 8000.f;
+
+	/** 곡률 스칼라('Curvature'/'CurveStartDist')를 담은 Material Parameter Collection. 기본 /Game/Maze/MPC_Curve 자동 로드. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	TObjectPtr<UMaterialParameterCollection> CurveMPC;
 
@@ -235,7 +240,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	bool bShiftCurvedFloor = true;
 
-	/** 바닥 타일에 쓸 평면 메시(기본 엔진 Plane). 셀 크기에 맞춰 균일 스케일된다. */
+	/** 바닥 타일 메시(기본 엔진 Cube → 얇은 슬래브로 스케일). 닫힌 메시라 커브로 멀리서 위로 말려도
+	 *  아랫면이 그려진다(Plane은 단면이라 말리는 순간 백페이스 컬링으로 사라짐). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	TObjectPtr<UStaticMesh> FloorStaticMesh;
 
@@ -338,6 +344,9 @@ private:
 
 	/** Center 셀 기준 ±Radius 윈도우 안의 셀마다 바닥 타일을 FloorISM에 깐다(시프트 모드 휘는 바닥). */
 	void BuildFloorInWindow(FIntPoint Center, int32 Radius);
+
+	/** MPC에 곡률 스칼라(Curvature/CurveStartDist)를 주입한다. 시프트 사이클마다 재주입 → PIE 중 튜닝 즉시 반영. */
+	void ApplyWorldCurve();
 
 	/** 런타임: 플레이어 위치를 셀로 변환해 윈도우 중심이 바뀌었으면 다시 렌더한다. */
 	void UpdateRenderWindow();

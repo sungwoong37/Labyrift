@@ -63,11 +63,18 @@ AMazeGenerator::AMazeGenerator()
 	FloorISM->SetupAttachment(WallISM);
 	FloorISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 
-	// 기본 바닥 메시 = 엔진 Plane(정점 4개라 타일마다 통째로 기울어 곡면 근사).
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> PlaneMesh(TEXT("/Engine/BasicShapes/Plane.Plane"));
-	if (PlaneMesh.Succeeded())
+	// 기본 바닥 메시 = 엔진 큐브(얇은 슬래브로 스케일). 닫힌 메시라 커브로 멀리서 위로 말려도 아랫면이
+	// 그려진다 — Plane(단면)은 말려 올라가 시점보다 높아지는 순간 백페이스 컬링으로 사라졌다.
+	if (CubeMesh.Succeeded())
 	{
-		FloorStaticMesh = PlaneMesh.Object;
+		FloorStaticMesh = CubeMesh.Object;
+	}
+
+	// 곡률 MPC 기본 자동 로드. 미지정이면 CurveStrength 주입이 안 돼 MPC 애셋 기본값으로만 휜다(WIP 때 증상).
+	static ConstructorHelpers::FObjectFinder<UMaterialParameterCollection> CurveMpcAsset(TEXT("/Game/Maze/MPC_Curve.MPC_Curve"));
+	if (CurveMpcAsset.Succeeded())
+	{
+		CurveMPC = CurveMpcAsset.Object;
 	}
 }
 
@@ -121,11 +128,18 @@ void AMazeGenerator::BeginPlay()
 			UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: ShiftMode ON, timer=%.2fs, goal=(%d,%d)."), ShiftInterval, ShiftGoalCell.X, ShiftGoalCell.Y);
 			if (GEngine) { GEngine->AddOnScreenDebugMessage(-1, 8.f, FColor::Green, TEXT("ShiftMode ON (timer started)")); }
 
-			// 월드 커브: 머티리얼 WPO가 읽는 MPC 'Curvature'에 곡률을 주입(휨은 시각만, 충돌/이동은 평면).
-			if (bWorldCurve && CurveMPC)
+			// 월드 커브: 머티리얼 WPO가 읽는 MPC에 곡률을 주입(휨은 시각만, 충돌/이동은 평면).
+			if (bWorldCurve)
 			{
-				UKismetMaterialLibrary::SetScalarParameterValue(World, CurveMPC, TEXT("Curvature"), CurveStrength);
-				UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: WorldCurve ON, Curvature=%.5f."), CurveStrength);
+				if (CurveMPC)
+				{
+					ApplyWorldCurve();
+					UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: WorldCurve ON — Curvature=%.6f StartDist=%.0f."), CurveStrength, CurveStartDist);
+				}
+				else
+				{
+					UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: WorldCurve — CurveMPC 미지정 → 곡률 주입 불가(MPC 애셋 기본값으로만 휨)."));
+				}
 			}
 
 			// 시프트 안개: 천장 부재(하늘)와 X방향 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다.
@@ -586,18 +600,24 @@ void AMazeGenerator::BuildFloorInWindow(FIntPoint Center, int32 Radius)
 	FloorISM->SetStaticMesh(FloorStaticMesh);
 	if (FloorMaterial)
 	{
+		// ISM usage 플래그를 먼저 보장(게임스레드 동기). 없으면 SetMaterial 시 비동기 재컴파일 레이스로
+		// 프록시가 "WPO 안 씀"으로 굳어 바닥만 안 휜다(벽은 애니가 프록시를 재생성해 우연히 복구됐던 것).
+		FloorMaterial->CheckMaterialUsage(EMaterialUsage::MATUSAGE_InstancedStaticMeshes);
 		FloorISM->SetMaterial(0, FloorMaterial);
 	}
 	FloorISM->ClearInstances();
 
-	// 평면 메시 바운드 → 셀 크기에 맞춘 균일 스케일(Plane 피벗은 중앙이라 셀 중심에 그대로 놓는다).
+	// 메시 바운드 → XY는 셀 크기, Z는 얇은 슬래브 두께로 스케일. 윗면이 z=0(숨긴 충돌 바닥 높이)에 오도록 내린다.
 	const FBoxSphereBounds B = FloorStaticMesh->GetBounds();
 	const float MeshX = B.BoxExtent.X * 2.f;
 	const float MeshY = B.BoxExtent.Y * 2.f;
+	const float MeshZ = B.BoxExtent.Z * 2.f;
+	constexpr float TileThickness = 10.f;
 	const FVector FloorScale(
 		(MeshX > KINDA_SMALL_NUMBER) ? CellSize / MeshX : 1.f,
 		(MeshY > KINDA_SMALL_NUMBER) ? CellSize / MeshY : 1.f,
-		1.f);
+		(MeshZ > KINDA_SMALL_NUMBER) ? TileThickness / MeshZ : 1.f);
+	const float TileZ = -(B.Origin.Z + B.BoxExtent.Z) * FloorScale.Z; // 메시 윗면을 z=0에 정렬(Plane처럼 납작한 메시면 0).
 
 	const int32 MinX = FMath::Clamp(Center.X - Radius, 0, GridWidth - 1);
 	const int32 MaxX = FMath::Clamp(Center.X + Radius, 0, GridWidth - 1);
@@ -610,8 +630,8 @@ void AMazeGenerator::BuildFloorInWindow(FIntPoint Center, int32 Radius)
 	{
 		for (int32 X = MinX; X <= MaxX; ++X)
 		{
-			// 셀 중심, 바닥면 Z=0. 휨은 머티리얼 WPO가 담당(여기선 평면 타일만 배치).
-			Transforms.Emplace(FQuat::Identity, FVector(X * CellSize, Y * CellSize, 0.f), FloorScale);
+			// 셀 중심, 윗면 z=0. 휨은 머티리얼 WPO가 담당(여기선 평평한 슬래브만 배치).
+			Transforms.Emplace(FQuat::Identity, FVector(X * CellSize, Y * CellSize, TileZ), FloorScale);
 		}
 	}
 	if (Transforms.Num() > 0)
@@ -623,13 +643,17 @@ void AMazeGenerator::BuildFloorInWindow(FIntPoint Center, int32 Radius)
 		*FloorStaticMesh->GetName(),
 		FloorMaterial ? *FloorMaterial->GetName() : TEXT("(none→메시기본=평평)"),
 		FloorActorToHide ? *FloorActorToHide->GetName() : TEXT("(none)"));
+}
 
-	// [FloorDiag] 휨이 안 보이는 원인 격리: 실제 적용된 머티리얼(SetMaterial 반영) + 곡률 주입값(벽과 공유 MPC).
-	UMaterialInterface* AppliedMat = FloorISM->GetMaterial(0);
-	float CurMpc = -999.f;
-	if (CurveMPC) { CurMpc = UKismetMaterialLibrary::GetScalarParameterValue(GetWorld(), CurveMPC, TEXT("Curvature")); }
-	UE_LOG(LogTemp, Warning, TEXT("[FloorDiag] appliedMat(slot0)=%s MPC.Curvature=%.5f CurveStrength=%.5f bWorldCurve=%d"),
-		AppliedMat ? *AppliedMat->GetName() : TEXT("null"), CurMpc, CurveStrength, bWorldCurve ? 1 : 0);
+void AMazeGenerator::ApplyWorldCurve()
+{
+	UWorld* World = GetWorld();
+	if (!World || !bWorldCurve || !CurveMPC)
+	{
+		return;
+	}
+	UKismetMaterialLibrary::SetScalarParameterValue(World, CurveMPC, TEXT("Curvature"), CurveStrength);
+	UKismetMaterialLibrary::SetScalarParameterValue(World, CurveMPC, TEXT("CurveStartDist"), CurveStartDist);
 }
 
 void AMazeGenerator::UpdateRenderWindow()
@@ -764,6 +788,9 @@ void AMazeGenerator::ShiftTick()
 		PlayerLoc = Pawn->GetActorLocation();
 		EnsureShiftFlashlight(Pawn);
 	}
+
+	// 곡률 재주입: PIE 중 CurveStrength/CurveStartDist를 고치면 다음 사이클에 바로 반영(튜닝 루프 단축).
+	ApplyWorldCurve();
 
 	// 첫 사이클: 플레이어 시작→목표 경로 산출 + Tick 애니 구동 활성(폰이 준비된 지금 안전하게).
 	if (!bShiftActive)
