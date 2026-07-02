@@ -76,6 +76,13 @@ AMazeGenerator::AMazeGenerator()
 	{
 		CurveMPC = CurveMpcAsset.Object;
 	}
+
+	// 기본 바닥 머티리얼 = 이끼 바닥(Megascans 텍스처 + 커브 WPO + ISM usage 선저장). 에디터 지정 시 그쪽 우선.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> FloorMatAsset(TEXT("/Game/Maze/M_MazeFloor.M_MazeFloor"));
+	if (FloorMatAsset.Succeeded())
+	{
+		FloorMaterial = FloorMatAsset.Object;
+	}
 }
 
 void AMazeGenerator::OnConstruction(const FTransform& Transform)
