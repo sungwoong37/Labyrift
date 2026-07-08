@@ -10,6 +10,8 @@
 #include "MazeGenerator.generated.h"
 
 class UInstancedStaticMeshComponent;
+class UHierarchicalInstancedStaticMeshComponent;
+class UStaticMeshComponent;
 class UStaticMesh;
 class AMazeExit;
 class AMazeChaser;
@@ -21,7 +23,7 @@ class UMaterialInterface;
 
 /**
  * 시드 기반 결정론적 랜덤 미로 생성기 (Phase 1).
- * FRandomStream(Seed)로 DFS 백트래킹 미로를 만들고, 벽을 HISM 인스턴스로 배치한다.
+ * FRandomStream(Seed)로 DFS 백트래킹 미로를 만들고, 벽을 ISM 인스턴스로 배치한다.
  * 같은 Seed면 항상 동일한 미로가 나온다.
  */
 UCLASS()
@@ -106,6 +108,21 @@ public:
 	/** 켜면 BeginPlay에 레벨의 퍼즐/목표 액터를 방에 분배 배치한다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Rooms")
 	bool bDistributeRoomActors = true;
+
+	// --- 시작 구역 — 미로 '밖'(서쪽) 마당+전망대에서 시작, 테두리 입구로 진입(미로와 시작 지점 분리) ---
+
+	/** 켜면 미로 서쪽 밖에 시작 구역(마당+전망대+경사로)을 만들고 (0,0) 서쪽 테두리에 입구를 뚫는다.
+	 *  미로 데이터 자체는 건드리지 않으므로(테두리 비트 1개 제외) 같은 Seed의 방 배치가 그대로 유지된다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start")
+	bool bStartZone = true;
+
+	/** 켜면 BeginPlay 직후 플레이어를 시작 구역(전망대 위)으로 순간이동시킨다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start")
+	bool bTeleportPlayerToStart = true;
+
+	/** 시작 전망대(단상) 높이(cm). WallHeight보다 높으면 벽 너머로 미로 전경이 내려다보인다. 0이면 평지 시작(단상/경사로 없음). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start", meta = (ClampMin = "0.0"))
+	float StartPlatformHeight = 520.f;
 
 	// --- 피날레(클리어 후 탈출극) ---
 
@@ -195,9 +212,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
 	int32 ShiftBackCells = 3;
 
-	/** 켜면 시프트 후보 벽(얼림/열기후보/닫기후보)과 원뿔을 디버그 드로로 표시(개발용). */
+	/** 켜면 시프트 후보 벽(얼림/열기후보/닫기후보)과 원뿔을 디버그 드로로 표시(개발용, 기본 꺼짐). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
-	bool bShiftDebugDraw = true;
+	bool bShiftDebugDraw = false;
 
 	/** 켜면 시프트 모드에서 플레이어 카메라에 손전등(스포트라이트)을 코드로 부착(어둠 동행, BP 불필요). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
@@ -279,6 +296,59 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float FogMaxOpacity = 1.f;
 
+	/** 켜면 벽 위쪽(천장 방향)에 2차 안개 레이어를 얹어 위를 볼 때 안개가 더 짙다(수평 안개와 독립 조절). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
+	bool bCeilingFog = true;
+
+	/** 천장(2차) 안개 밀도. 주 안개(FogDensity)보다 크게 잡아 위쪽을 확실히 덮는다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
+	float CeilingFogDensity = 0.1f;
+
+	/** 천장 안개 레이어의 높이 오프셋(cm, 주 안개 기준 높이에서 위로). 벽 높이 위쯤에 두면 벽 너머 위가 덮인다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
+	float CeilingFogHeightOffset = 600.f;
+
+	/** 천장 안개의 상방 감쇠. 주 안개(0.005)보다 크게 → 천장 부근에 집중되고 위로 갈수록 얇아진다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
+	float CeilingFogHeightFalloff = 0.02f;
+
+	// --- 원거리 필드(Far Field) — 렌더 윈도우 밖을 '값싼 벽/바닥'으로 채워 하드 컷 없이 먼 거리까지 보이게 ---
+
+	/** 켜면 일반 모드에서 미로 전체를 덮는 원거리 벽 레이어(HISM, 충돌/그림자 없음)를 깐다.
+	 *  근거리 윈도우 벽이 위에 겹쳐 그려지므로 창 이동 시 리빌드가 필요 없다(BeginPlay 1회 빌드). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField")
+	bool bFarWalls = true;
+
+	/** 원거리 벽 머티리얼(텍스처 없는 값싼 것 권장, 단 커브 WPO는 근거리와 동일해야 함).
+	 *  기본 /Game/Maze/M_MazeWallFar 자동 로드. 없으면 메시 기본 머티리얼로 폴백. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField")
+	TObjectPtr<UMaterialInterface> FarWallMaterial;
+
+	/** 원거리 벽 병합 상한(셀). 일직선 연속 벽을 이 길이까지 인스턴스 1개로 합친다(개수 1/3~1/5).
+	 *  커브 WPO는 정점만 휘므로 너무 길게 합치면 곡면이 직선 현(chord)으로 각져 보인다 — 4셀 권장. 1=병합 없음. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField", meta = (ClampMin = "1"))
+	int32 FarMergeMaxRunCells = 4;
+
+	/** 원거리 벽 축소 비율. 근거리 벽보다 살짝 작게 만들어 '안쪽'에 숨긴다 → 겹쳐도 z-파이팅 없음. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField", meta = (ClampMin = "0.5", ClampMax = "1.0"))
+	float FarWallShrink = 0.97f;
+
+	/** 원거리 벽 컬링 거리(cm). 0=무제한(안개가 가릴 때). >0이면 그 너머 인스턴스는 렌더 제외. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField", meta = (ClampMin = "0.0"))
+	float FarCullDistance = 0.f;
+
+	/** 켜면 시프트 모드에서 근거리 바닥 창 밖을 굵은 슈퍼타일 바닥(충돌/그림자 없음)으로 채운다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField")
+	bool bFarFloor = true;
+
+	/** 원거리 바닥 슈퍼타일 한 변의 셀 수. 크면 인스턴스가 줄지만 커브 WPO 현 오차로 타일 경계가 꺼져 보인다 — 8 이하 권장. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField", meta = (ClampMin = "1"))
+	int32 FarFloorTileCells = 8;
+
+	/** 원거리 바닥 머티리얼(값싼 단색 + 커브 WPO). 기본 /Game/Maze/M_MazeFloorFar 자동 로드. 없으면 FloorMaterial로 폴백. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField")
+	TObjectPtr<UMaterialInterface> FarFloorMaterial;
+
 	/** 미로 데이터를 (재)생성한다(렌더는 윈도우가 담당). 디테일 패널 버튼 또는 BP에서 호출 가능. */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Maze")
 	void GenerateMaze();
@@ -317,6 +387,27 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
 	TObjectPtr<UInstancedStaticMeshComponent> FloorISM;
 
+	/** 원거리 벽 레이어(HISM — 클러스터 컬링/LOD 무료). 애니 없음 → 인스턴스 인덱스 안정성 불필요라 HISM 안전.
+	 *  근거리 WallISM은 피날레/시프트가 인덱스에 의존하므로 절대 HISM으로 바꾸지 말 것. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UHierarchicalInstancedStaticMeshComponent> FarWallISM;
+
+	/** 원거리 바닥 슈퍼타일 ISM(시프트 모드). 충돌/그림자 없음. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UInstancedStaticMeshComponent> FarFloorISM;
+
+	/** 시작 구역 마당 바닥 슬래브(미로 서쪽 밖, 레벨 바닥 범위에 의존하지 않는 자기완결 지면). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartGround;
+
+	/** 시작 구역 전망대 단상(런타임에 미로 밖 마당 서쪽 끝에 배치·표시). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartPlatform;
+
+	/** 전망대에서 마당 바닥으로 내려가는 경사로(내려와 +X로 걸으면 미로 입구). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartRamp;
+
 private:
 	/** 셀별 벽 비트마스크 저장 (크기 = GridWidth * GridHeight). */
 	TArray<uint8> Cells;
@@ -335,15 +426,47 @@ private:
 	/** 레벨의 퍼즐/목표 액터를 방에 분배한다(퍼즐=서로 다른 방, 목표=가장 먼 방). */
 	void DistributeRoomActors();
 
-	/** 시작점(0,0)에서 가장 먼 방의 인덱스(목표지점용). */
+	/** 시작 셀(GetStartCell=입구)에서 가장 먼 방의 인덱스(목표지점용). */
 	int32 GetGoalRoomIndex() const;
 
-	/** Center 셀 기준 ±Radius 윈도우 안의 벽만 HISM 인스턴스로 배치한다(기존 인스턴스는 교체).
+	/** 시작 셀 = 미로 입구 (0,0). 시작 구역이 (0,0) 서쪽 밖이라 입구 셀이 거리 기준점. */
+	FIntPoint GetStartCell() const;
+
+	/** 미로 서쪽 밖에 시작 구역(마당 슬래브+전망대 단상+경사로)을 배치·표시한다(런타임, bStartZone일 때). */
+	void BuildStartZone();
+
+	/** 플레이어를 전망대 위(단상 없으면 마당 중앙)로 순간이동 + 반대편 코너를 향해 시선 고정.
+	 *  폰 소유가 액터 BeginPlay보다 늦을 수 있어 다음 틱 타이머로 재시도한다. */
+	void PlacePlayerAtStart();
+
+	/** 전망대 상판 중심(액터 로컬). BuildStartZone이 채우고 PlacePlayerAtStart가 사용. */
+	FVector StartPlatformTopLocal = FVector::ZeroVector;
+
+	/** 시작 마당 중앙(액터 로컬). 단상이 꺼졌을 때의 스폰 지점. */
+	FVector StartYardCenterLocal = FVector::ZeroVector;
+
+	/** PlacePlayerAtStart 폰 대기 재시도 횟수(무한 재시도 방지). */
+	int32 StartPlaceRetries = 0;
+
+	/** Center 셀 기준 ±Radius 윈도우 안의 벽만 ISM 인스턴스로 배치한다(기존 인스턴스는 교체).
 	 *  bRecordInstanceMap이 켜져 있으면 (X,Y,Side)→인스턴스 인덱스를 WallInstanceIndex에 기록한다. */
 	void BuildWallsInWindow(FIntPoint Center, int32 Radius);
 
 	/** Center 셀 기준 ±Radius 윈도우 안의 셀마다 바닥 타일을 FloorISM에 깐다(시프트 모드 휘는 바닥). */
 	void BuildFloorInWindow(FIntPoint Center, int32 Radius);
+
+	/** 미로 전체의 벽을 원거리 레이어(FarWallISM)로 1회 빌드. 일직선 연속 벽은 FarMergeMaxRunCells까지 병합.
+	 *  Cells의 순수 함수(RNG 없음) — 결정론 자동. 근거리 벽보다 FarWallShrink만큼 작아 안쪽에 숨는다. */
+	void BuildFarWalls();
+
+	/** 미로 전체를 FarFloorTileCells 간격 슈퍼타일 바닥으로 1회 빌드(시프트 모드). 상판 z=-2cm로 근거리 바닥 아래. */
+	void BuildFarFloor();
+
+	/** 원거리 레이어(벽+바닥) 표시 토글. 피날레 전체 렌더 중엔 숨긴다(중복/유령 벽 방지). */
+	void SetFarLayerVisible(bool bVisible);
+
+	/** 런타임(시프트): 플레이어가 Step 이상 움직였으면 근거리 바닥 창을 다시 깐다(UpdateRenderWindow의 바닥판). */
+	void UpdateFloorWindow();
 
 	/** MPC에 곡률 스칼라(Curvature/CurveStartDist)를 주입한다. 시프트 사이클마다 재주입 → PIE 중 튜닝 즉시 반영. */
 	void ApplyWorldCurve();
@@ -523,6 +646,12 @@ private:
 
 	/** 렌더 윈도우 갱신 타이머 핸들. */
 	FTimerHandle WindowTimer;
+
+	/** 마지막으로 바닥 창을 깐 중심 셀(시프트 모드). 벽 창과 독립 추적. */
+	FIntPoint LastFloorCenter = FIntPoint(MIN_int32, MIN_int32);
+
+	/** 바닥 창 갱신 타이머 핸들(시프트 모드). */
+	FTimerHandle FloorTimer;
 
 	// --- 관측-반응 시프트 모드 내부 상태/헬퍼 ---
 

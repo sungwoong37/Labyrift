@@ -6,8 +6,10 @@
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Components/ExponentialHeightFogComponent.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SpotLightComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
 #include "Engine/ExponentialHeightFog.h"
@@ -83,6 +85,56 @@ AMazeGenerator::AMazeGenerator()
 	{
 		FloorMaterial = FloorMatAsset.Object;
 	}
+
+	// 원거리 벽 레이어 — HISM(클러스터 컬링/LOD 무료). 시각 전용: 충돌·그림자·내비 전부 끔.
+	// 근거리 WallISM은 피날레/시프트의 인스턴스 인덱스 의존 때문에 일반 ISM 유지(여긴 애니가 없어 HISM 안전).
+	FarWallISM = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("FarWallISM"));
+	FarWallISM->SetupAttachment(WallISM);
+	FarWallISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	FarWallISM->SetCastShadow(false);
+	FarWallISM->SetCanEverAffectNavigation(false);
+
+	// 원거리 바닥 슈퍼타일(시프트 모드). 개수가 적어 일반 ISM으로 충분.
+	FarFloorISM = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("FarFloorISM"));
+	FarFloorISM->SetupAttachment(WallISM);
+	FarFloorISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	FarFloorISM->SetCastShadow(false);
+	FarFloorISM->SetCanEverAffectNavigation(false);
+
+	// 원거리 전용 머티리얼(텍스처 없는 값싼 것 + 동일 커브 WPO). 애셋이 아직 없으면 폴백으로 동작(프로젝트 관례).
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> FarWallMatAsset(TEXT("/Game/Maze/M_MazeWallFar.M_MazeWallFar"));
+	if (FarWallMatAsset.Succeeded())
+	{
+		FarWallMaterial = FarWallMatAsset.Object;
+	}
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> FarFloorMatAsset(TEXT("/Game/Maze/M_MazeFloorFar.M_MazeFloorFar"));
+	if (FarFloorMatAsset.Succeeded())
+	{
+		FarFloorMaterial = FarFloorMatAsset.Object;
+	}
+
+	// 시작 구역(미로 서쪽 밖): 마당 슬래브 + 전망대 단상 + 경사로. 기하는 런타임 BuildStartZone이 배치 → 평소엔 숨김.
+	StartGround = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartGround"));
+	StartGround->SetupAttachment(WallISM);
+	StartGround->SetCollisionProfileName(TEXT("BlockAll"));
+	StartGround->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartGround->SetVisibility(false);
+	StartPlatform = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartPlatform"));
+	StartPlatform->SetupAttachment(WallISM);
+	StartPlatform->SetCollisionProfileName(TEXT("BlockAll"));
+	StartPlatform->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartPlatform->SetVisibility(false);
+	StartRamp = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartRamp"));
+	StartRamp->SetupAttachment(WallISM);
+	StartRamp->SetCollisionProfileName(TEXT("BlockAll"));
+	StartRamp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartRamp->SetVisibility(false);
+	if (CubeMesh.Succeeded())
+	{
+		StartGround->SetStaticMesh(CubeMesh.Object);
+		StartPlatform->SetStaticMesh(CubeMesh.Object);
+		StartRamp->SetStaticMesh(CubeMesh.Object);
+	}
 }
 
 void AMazeGenerator::OnConstruction(const FTransform& Transform)
@@ -105,6 +157,14 @@ void AMazeGenerator::BeginPlay()
 
 	// 레벨의 퍼즐/목표 액터를 방에 분배(퍼즐=서로 다른 방, 목표=가장 먼 방).
 	DistributeRoomActors();
+
+	// 시작 구역(미로 밖 마당+전망대) 배치 + 플레이어를 그 위로 순간이동(다음 틱 — 폰 소유가 우리 BeginPlay보다 늦을 수 있음).
+	BuildStartZone();
+	if (bTeleportPlayerToStart && bStartZone)
+	{
+		StartPlaceRetries = 0;
+		GetWorldTimerManager().SetTimerForNextTick(this, &AMazeGenerator::PlacePlayerAtStart);
+	}
 
 	if (UWorld* World = GetWorld())
 	{
@@ -153,9 +213,13 @@ void AMazeGenerator::BeginPlay()
 			EnsureShiftFog();
 
 			// 휘는 바닥: 셀 타일 ISM을 깔고 레벨 평면 바닥을 숨긴다(커브는 벽과 같은 머티리얼 WPO가 담당, 충돌은 숨긴 바닥 유지).
+			// 예전엔 전체 미로를 한 번에 깔았음(대형 격자 시작 히칭) → 이제 플레이어 창만 깔고 타이머로 따라간다.
+			// 바닥은 WallInstanceIndex와 무관해 시프트 모드에서도 리빌드가 안전(벽이 창 방식을 못 쓰는 이유는 인덱스).
 			if (bShiftCurvedFloor)
 			{
-				BuildFloorInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
+				UpdateFloorWindow(); // 첫 호출은 센티널로 즉시 빌드.
+				World->GetTimerManager().SetTimer(FloorTimer, this, &AMazeGenerator::UpdateFloorWindow, WindowUpdateInterval, /*bLoop=*/true);
+				BuildFarFloor(); // 창 밖은 굵은 슈퍼타일로 1회 커버.
 				if (FloorActorToHide)
 				{
 					FloorActorToHide->SetActorHiddenInGame(true);
@@ -178,6 +242,10 @@ void AMazeGenerator::BeginPlay()
 		UpdateRenderWindow();
 		World->GetTimerManager().SetTimer(WindowTimer, this, &AMazeGenerator::UpdateRenderWindow, WindowUpdateInterval, /*bLoop=*/true);
 
+		// 원거리 벽 레이어: 창 밖 하드 컷을 병합 HISM으로 채운다(1회 빌드, 창 이동과 무관).
+		// 시프트 모드는 전 벽이 개폐 애니 대상이라 전체 근거리 렌더를 유지 → 여기(일반 모드)에서만 깐다.
+		BuildFarWalls();
+
 		// 피날레: 레벨의 목표지점들이 클리어되면 미로 재배열 + 출구 생성을 시작하도록 구독.
 		if (bEnableFinale)
 		{
@@ -194,14 +262,16 @@ void AMazeGenerator::BeginPlay()
 
 int32 AMazeGenerator::GetGoalRoomIndex() const
 {
-	int32 Best = 0;
+	// 시작 셀(=입구 (0,0))에서 가장 먼 방이 목표 방.
+	const FIntPoint SC = GetStartCell();
+	int32 Best = INDEX_NONE;
 	double BestDistSq = -1.0;
 	for (int32 i = 0; i < Rooms.Num(); ++i)
 	{
 		const FIntRect& R = Rooms[i];
-		// 방 중심 셀(Max 배타적). 시작점(0,0)에서의 거리².
-		const double Cx = (R.Min.X + R.Max.X - 1) * 0.5;
-		const double Cy = (R.Min.Y + R.Max.Y - 1) * 0.5;
+		// 방 중심 셀(Max 배타적)에서 시작 셀까지의 거리².
+		const double Cx = (R.Min.X + R.Max.X - 1) * 0.5 - SC.X;
+		const double Cy = (R.Min.Y + R.Max.Y - 1) * 0.5 - SC.Y;
 		const double DistSq = Cx * Cx + Cy * Cy;
 		if (DistSq > BestDistSq)
 		{
@@ -209,7 +279,135 @@ int32 AMazeGenerator::GetGoalRoomIndex() const
 			Best = i;
 		}
 	}
-	return Best;
+	return (Best != INDEX_NONE) ? Best : 0;
+}
+
+FIntPoint AMazeGenerator::GetStartCell() const
+{
+	// 시작 구역은 미로 서쪽 '밖' → 미로 안 기준점은 입구 셀 (0,0).
+	return FIntPoint(0, 0);
+}
+
+void AMazeGenerator::BuildStartZone()
+{
+	// 런타임 전용. 미로 서쪽 '밖'(로컬 -X)에 자기완결 시작 구역을 세운다:
+	// [서쪽 끝] 전망대 단상 → 30° 경사로 → 마당 슬래브 → (+X로 걸으면) (0,0) 서쪽 테두리 입구.
+	// 마당에 자체 바닥 슬래브를 두는 이유: 레벨 바닥(Floor_0)의 범위에 의존하지 않기 위해(대형 미로/이동 배치에도 안전).
+	auto HideAll = [this]()
+	{
+		for (UStaticMeshComponent* C : { StartGround.Get(), StartPlatform.Get(), StartRamp.Get() })
+		{
+			if (C) { C->SetVisibility(false); C->SetCollisionEnabled(ECollisionEnabled::NoCollision); }
+		}
+	};
+	const bool bWant = GetWorld() && GetWorld()->IsGameWorld() && bStartZone
+		&& StartGround && StartPlatform && StartRamp && StartGround->GetStaticMesh();
+	if (!bWant)
+	{
+		HideAll();
+		return;
+	}
+
+	// 메시 실제 크기에서 스케일 산출(엔진 큐브=100cm 가정하지 않음 — 다른 메시를 꽂아도 동작).
+	const FBoxSphereBounds MB = StartGround->GetStaticMesh()->GetBounds();
+	const FVector MeshSize = MB.BoxExtent * 2.0;
+	const float SX = FMath::Max(static_cast<float>(MeshSize.X), UE_KINDA_SMALL_NUMBER);
+	const float SY = FMath::Max(static_cast<float>(MeshSize.Y), UE_KINDA_SMALL_NUMBER);
+	const float SZ = FMath::Max(static_cast<float>(MeshSize.Z), UE_KINDA_SMALL_NUMBER);
+
+	const float HalfCell = CellSize * 0.5f;
+	const float PlatSize = CellSize * 1.5f; // 단상 한 변 = 1.5셀 — 서 있을 충분한 발판.
+	constexpr float RampAngleDeg = 30.f;    // 캐릭터 기본 보행 한계(≈44°) 안.
+	constexpr float RampThickness = 20.f;
+	constexpr float YardMargin = 500.f;     // 경사로 착지 후 입구까지의 평지 여유.
+	constexpr float GroundThickness = 30.f;
+	const float Run = (StartPlatformHeight > 0.f)
+		? StartPlatformHeight / FMath::Tan(FMath::DegreesToRadians(RampAngleDeg))
+		: 0.f;
+	// 마당 깊이(서쪽 방향) = 단상 + 경사로 런 + 여유. 평지 시작(높이 0)이어도 최소 3셀은 확보.
+	const float ZoneDepth = FMath::Max(PlatSize + Run + YardMargin, CellSize * 3.f);
+
+	// 마당 슬래브: X [-HalfCell-ZoneDepth, -HalfCell], Y [-1.5셀, +1.5셀](입구 셀 (0,0) 폭을 가운데 포함), 상판 z=0.
+	const float YardMinX = -HalfCell - ZoneDepth;
+	const float YardWidth = CellSize * 3.f;
+	const FVector GroundCenter(YardMinX + ZoneDepth * 0.5f, 0.f, -GroundThickness * 0.5f);
+	const FVector GroundScale(ZoneDepth / SX, YardWidth / SY, GroundThickness / SZ);
+	StartGround->SetRelativeTransform(FTransform(FQuat::Identity, GroundCenter - FVector(MB.Origin) * GroundScale, GroundScale));
+	StartGround->SetVisibility(true);
+	StartGround->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+	// 스폰 폴백(단상 없음) 지점 = 마당 중앙.
+	StartYardCenterLocal = FVector(YardMinX + ZoneDepth * 0.5f, 0.f, 0.f);
+
+	if (StartPlatformHeight <= 0.f)
+	{
+		// 평지 시작: 마당만 두고 단상/경사로는 숨김.
+		StartPlatform->SetVisibility(false); StartPlatform->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		StartRamp->SetVisibility(false);     StartRamp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 시작 구역 배치(평지) — 마당 깊이 %.0fcm."), ZoneDepth);
+		return;
+	}
+
+	// 단상: 마당 서쪽 끝. 위에서 벽 너머 미로 전경이 내려다보인다.
+	const FVector PlatCenter(YardMinX + PlatSize * 0.5f, 0.f, StartPlatformHeight * 0.5f);
+	const FVector PlatScale(PlatSize / SX, PlatSize / SY, StartPlatformHeight / SZ);
+	StartPlatform->SetRelativeTransform(FTransform(FQuat::Identity, PlatCenter - FVector(MB.Origin) * PlatScale, PlatScale));
+	StartPlatform->SetVisibility(true);
+	StartPlatform->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+	// 경사로: 단상 +X(동쪽) 모서리 상단(A)에서 마당 바닥(B)으로 내리막.
+	const FVector A(YardMinX + PlatSize, 0.f, StartPlatformHeight); // 단상 모서리(걷는 면 높이).
+	const FVector B(A.X + Run, A.Y, 0.f);                          // 마당 착지점.
+	const float Len = (B - A).Size() + 80.f; // 양 끝을 살짝 겹쳐 틈 방지.
+	const FQuat RampRot = FRotator(-RampAngleDeg, 0.f, 0.f).Quaternion(); // +X로 갈수록 내려가는 내리막.
+	const FVector RampScale(Len / SX, PlatSize / SY, RampThickness / SZ);
+	// 슬래브 '윗면'이 A-B 걷는 선에 오도록 중심을 두께 절반만큼 경사면 법선 아래로 내린다.
+	const FVector Mid = (A + B) * 0.5f;
+	const FVector RampCenter = Mid - RampRot.RotateVector(FVector(0.f, 0.f, RampThickness * 0.5f));
+	StartRamp->SetRelativeTransform(FTransform(RampRot, RampCenter - RampRot.RotateVector(FVector(MB.Origin) * RampScale), RampScale));
+	StartRamp->SetVisibility(true);
+	StartRamp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+	// 플레이어 스폰 지점(상판 중심) 기록.
+	StartPlatformTopLocal = FVector(PlatCenter.X, PlatCenter.Y, StartPlatformHeight);
+
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 시작 구역 배치 — 마당 깊이 %.0fcm, 전망대 %.0fcm, 경사로 런 %.0fcm."),
+		ZoneDepth, StartPlatformHeight, Run);
+}
+
+void AMazeGenerator::PlacePlayerAtStart()
+{
+	UWorld* World = GetWorld();
+	if (!World || !bStartZone)
+	{
+		return;
+	}
+	APlayerController* PC = World->GetFirstPlayerController();
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		// 폰 스폰/소유가 아직 — 다음 틱 재시도(상한으로 무한 대기 방지).
+		if (++StartPlaceRetries <= 60)
+		{
+			World->GetTimerManager().SetTimerForNextTick(this, &AMazeGenerator::PlacePlayerAtStart);
+		}
+		return;
+	}
+
+	// 전망대가 있으면 상판 위, 평지 시작이면 마당 중앙. Z+120 = 캡슐 절반+여유(피날레 리스폰과 같은 관례).
+	const bool bOnPlatform = StartPlatform && StartPlatform->IsVisible();
+	const FVector Local = (bOnPlatform ? StartPlatformTopLocal : StartYardCenterLocal) + FVector(0.f, 0.f, 120.f);
+	const FVector Loc = GetActorTransform().TransformPosition(Local);
+	Pawn->SetActorLocation(Loc, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+
+	// 시선: 미로 반대편 코너를 향해 yaw만 고정(핏치/롤은 플레이어 자유) — 대각선 전경이 첫 화면.
+	FRotator Face = (GetCellCenterWorld(GridWidth - 1, GridHeight - 1) - Loc).Rotation();
+	Face.Pitch = 0.f;
+	Face.Roll = 0.f;
+	PC->SetControlRotation(Face);
+
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 플레이어 시작 배치(미로 밖 시작 구역) — 전망대=%s."),
+		bOnPlatform ? TEXT("ON") : TEXT("OFF"));
 }
 
 void AMazeGenerator::DistributeRoomActors()
@@ -303,10 +501,11 @@ void AMazeGenerator::GenerateMaze()
 	ClearMaze();
 	WallISM->SetStaticMesh(WallStaticMesh);
 
-	// 데이터 산출(완벽한 미로) 후 방을 후처리로 뚫는다. 윈도우 중심 캐시는 무효화.
+	// 데이터 산출(완벽한 미로) 후 방을 후처리로 뚫는다. 윈도우 중심 캐시(벽/바닥)는 무효화.
 	CarveMaze();
 	CarveRooms();
 	LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
+	LastFloorCenter = FIntPoint(MIN_int32, MIN_int32);
 
 	// 에디터(비-게임 월드)에서는 안전 한도 내에서 원점 주변만 미리보기 렌더.
 	// 런타임에서는 BeginPlay 타이머의 UpdateRenderWindow가 플레이어 주변을 렌더한다.
@@ -327,6 +526,14 @@ void AMazeGenerator::ClearMaze()
 	if (FloorISM)
 	{
 		FloorISM->ClearInstances();
+	}
+	if (FarWallISM)
+	{
+		FarWallISM->ClearInstances();
+	}
+	if (FarFloorISM)
+	{
+		FarFloorISM->ClearInstances();
 	}
 }
 
@@ -413,50 +620,53 @@ void AMazeGenerator::CarveMaze()
 void AMazeGenerator::CarveRooms()
 {
 	Rooms.Reset();
-	if (RoomCount <= 0 || Cells.Num() == 0)
+	if (Cells.Num() == 0)
 	{
 		return;
 	}
 
-	const int32 MinSize = FMath::Max(2, FMath::Min(RoomMinSize, RoomMaxSize));
-	const int32 MaxSize = FMath::Max(MinSize, RoomMaxSize);
-
-	// Seed 파생: 미로 카브 스트림과 분리해 방 배치만 따로 결정론적으로 정한다.
-	const uint32 Mixed = static_cast<uint32>(Seed) * 2654435761u + 0x9E3779B9u;
-	FRandomStream RoomStream(static_cast<int32>(Mixed));
-
-	const int32 MaxAttempts = RoomCount * 20;
-	for (int32 Attempt = 0; Attempt < MaxAttempts && Rooms.Num() < RoomCount; ++Attempt)
+	if (RoomCount > 0)
 	{
-		const int32 W = RoomStream.RandRange(MinSize, MaxSize);
-		const int32 H = RoomStream.RandRange(MinSize, MaxSize);
+		const int32 MinSize = FMath::Max(2, FMath::Min(RoomMinSize, RoomMaxSize));
+		const int32 MaxSize = FMath::Max(MinSize, RoomMaxSize);
 
-		// 테두리에서 1칸 여유. 격자가 작아 안 들어가면 스킵(크래시 없음).
-		if (W > GridWidth - 2 || H > GridHeight - 2)
-		{
-			continue;
-		}
-		const int32 X0 = RoomStream.RandRange(1, GridWidth - W - 1);
-		const int32 Y0 = RoomStream.RandRange(1, GridHeight - H - 1);
-		const FIntRect Rect(X0, Y0, X0 + W, Y0 + H); // Max는 배타적.
+		// Seed 파생: 미로 카브 스트림과 분리해 방 배치만 따로 결정론적으로 정한다.
+		const uint32 Mixed = static_cast<uint32>(Seed) * 2654435761u + 0x9E3779B9u;
+		FRandomStream RoomStream(static_cast<int32>(Mixed));
 
-		// 기존 방과 1칸 마진을 두고 겹치면 버린다.
-		bool bOverlaps = false;
-		for (const FIntRect& R : Rooms)
+		const int32 MaxAttempts = RoomCount * 20;
+		for (int32 Attempt = 0; Attempt < MaxAttempts && Rooms.Num() < RoomCount; ++Attempt)
 		{
-			if (Rect.Min.X < R.Max.X + 1 && Rect.Max.X + 1 > R.Min.X &&
-				Rect.Min.Y < R.Max.Y + 1 && Rect.Max.Y + 1 > R.Min.Y)
+			const int32 W = RoomStream.RandRange(MinSize, MaxSize);
+			const int32 H = RoomStream.RandRange(MinSize, MaxSize);
+
+			// 테두리에서 1칸 여유. 격자가 작아 안 들어가면 스킵(크래시 없음).
+			if (W > GridWidth - 2 || H > GridHeight - 2)
 			{
-				bOverlaps = true;
-				break;
+				continue;
 			}
-		}
-		if (bOverlaps)
-		{
-			continue;
-		}
+			const int32 X0 = RoomStream.RandRange(1, GridWidth - W - 1);
+			const int32 Y0 = RoomStream.RandRange(1, GridHeight - H - 1);
+			const FIntRect Rect(X0, Y0, X0 + W, Y0 + H); // Max는 배타적.
 
-		Rooms.Add(Rect);
+			// 기존 방과 1칸 마진을 두고 겹치면 버린다.
+			bool bOverlaps = false;
+			for (const FIntRect& R : Rooms)
+			{
+				if (Rect.Min.X < R.Max.X + 1 && Rect.Max.X + 1 > R.Min.X &&
+					Rect.Min.Y < R.Max.Y + 1 && Rect.Max.Y + 1 > R.Min.Y)
+				{
+					bOverlaps = true;
+					break;
+				}
+			}
+			if (bOverlaps)
+			{
+				continue;
+			}
+
+			Rooms.Add(Rect);
+		}
 	}
 
 	// 방 내부 벽 열기 — 이미 연결된 미로에 간선만 추가하므로 연결성은 보존된다.
@@ -480,6 +690,14 @@ void AMazeGenerator::CarveRooms()
 				}
 			}
 		}
+	}
+
+	// 미로 입구: (0,0) 서쪽 테두리 개방 — 시작 구역(미로 밖 마당)에서 걸어 들어오는 문.
+	// CarveRooms 안에 두는 이유: 피날레 복구(CarveMaze+CarveRooms) 등 모든 재생성 경로에서 자동 재적용.
+	// RNG 미소비 → 결정론 유지. 시프트 개폐는 격자 내부 간선만 다루므로 이 입구가 닫힐 일은 없다.
+	if (bStartZone)
+	{
+		Cells[Index(0, 0)] &= ~Wall_West;
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 방 %d개 배치(요청 %d)."), Rooms.Num(), RoomCount);
@@ -645,11 +863,209 @@ void AMazeGenerator::BuildFloorInWindow(FIntPoint Center, int32 Radius)
 	{
 		FloorISM->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/false);
 	}
-	UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: 바닥 타일 %d개 mesh=%s material=%s hide=%s."),
+	// 창 방식으로 반복 호출되므로 로그는 Log 레벨(예전엔 1회 빌드라 Warning으로 눈에 띄게 했었음).
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 바닥 타일 %d개 mesh=%s material=%s hide=%s."),
 		FloorISM->GetInstanceCount(),
 		*FloorStaticMesh->GetName(),
 		FloorMaterial ? *FloorMaterial->GetName() : TEXT("(none→메시기본=평평)"),
 		FloorActorToHide ? *FloorActorToHide->GetName() : TEXT("(none)"));
+}
+
+void AMazeGenerator::UpdateFloorWindow()
+{
+	if (Cells.Num() == 0 || !bShiftCurvedFloor)
+	{
+		return;
+	}
+	// UpdateRenderWindow와 같은 히스테리시스 — 단, 바닥은 시프트 모드에서도 리빌드 안전(인스턴스 인덱스 무관).
+	const FIntPoint Center = GetPlayerCell();
+	const int32 Step = FMath::Max(1, RenderRadiusCells / 4);
+	const bool bFirstBuild = (LastFloorCenter.X == MIN_int32);
+	if (bFirstBuild ||
+		FMath::Max(FMath::Abs(Center.X - LastFloorCenter.X), FMath::Abs(Center.Y - LastFloorCenter.Y)) >= Step)
+	{
+		BuildFloorInWindow(Center, RenderRadiusCells);
+		LastFloorCenter = Center;
+	}
+}
+
+void AMazeGenerator::BuildFarWalls()
+{
+	if (!bFarWalls || !FarWallISM || !WallStaticMesh || Cells.Num() == 0)
+	{
+		return;
+	}
+
+	// 안전 한도: 초대형 미로는 병합해도 인스턴스가 수백만 개를 넘어 메모리가 터진다(MaxCells와 같은 철학).
+	// 이 한도(약 2백만 셀 ≈ 병합 후 ~130만 인스턴스)를 넘으면 원거리 레이어를 포기하고 기존 하드 컷으로 동작.
+	constexpr int64 FarMaxCells = 2000000;
+	if (static_cast<int64>(GridWidth) * GridHeight > FarMaxCells)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("AMazeGenerator: 셀 수가 원거리 레이어 한도(%lld) 초과 — FarWalls 생략."), FarMaxCells);
+		return;
+	}
+
+	FarWallISM->ClearInstances();
+	FarWallISM->SetStaticMesh(WallStaticMesh);
+	if (FarWallMaterial)
+	{
+		// ISM usage 플래그 선보장(게임스레드 동기) — BuildFloorInWindow의 비동기 리컴파일 레이스 회피와 동일 패턴.
+		FarWallMaterial->CheckMaterialUsage(EMaterialUsage::MATUSAGE_InstancedStaticMeshes);
+		FarWallISM->SetMaterial(0, FarWallMaterial);
+	}
+	if (FarCullDistance > 0.f)
+	{
+		FarWallISM->SetCullDistances(static_cast<int32>(FarCullDistance * 0.85f), static_cast<int32>(FarCullDistance));
+	}
+
+	// 스케일 규칙은 GetWallMeshScaling과 동일하되, 길이는 병합 구간(L셀)만큼 늘리고 전체를 FarWallShrink로 축소.
+	const FBoxSphereBounds MeshBounds = WallStaticMesh->GetBounds();
+	const FVector MeshSize = MeshBounds.BoxExtent * 2.0;
+	const double SizeX = FMath::Max<double>(MeshSize.X, UE_KINDA_SMALL_NUMBER);
+	const double SizeY = FMath::Max<double>(MeshSize.Y, UE_KINDA_SMALL_NUMBER);
+	const double SizeZ = FMath::Max<double>(MeshSize.Z, UE_KINDA_SMALL_NUMBER);
+	const double HUniform = CellSize / SizeX;
+	const double RenderedThickness = SizeY * HUniform;
+	const double CornerOverlap = FMath::Min<double>(WallThickness, RenderedThickness);
+	const float ScaleThickness = static_cast<float>(HUniform) * FarWallShrink;
+	const float ScaleHeight = static_cast<float>(WallHeight / SizeZ) * FarWallShrink;
+
+	const float HalfCell = CellSize * 0.5f;
+	// 밑면은 바닥(z=0)에 붙이고 위쪽만 낮아지게 — 축소분은 근거리 벽 속과 안개가 가린다.
+	const float ZCenter = WallHeight * FarWallShrink * 0.5f;
+	const int32 MaxRun = FMath::Max(1, FarMergeMaxRunCells);
+
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(Cells.Num() / 2); // 대략치 — 병합으로 실제는 더 적다.
+
+	// 병합 구간 하나를 인스턴스로 방출. BaseYaw 0=길이 X(북/남 벽), 90=길이 Y(동/서 벽).
+	auto EmplaceRun = [&](const FVector& DesiredCenter, int32 LenCells, float BaseYaw)
+	{
+		const float ScaleLength = static_cast<float>((LenCells * CellSize + CornerOverlap) / SizeX) * FarWallShrink;
+		const FVector Scale(ScaleLength, ScaleThickness, ScaleHeight);
+		const FQuat Rot = FRotator(0.f, BaseYaw + WallMeshYawOffset, 0.f).Quaternion();
+		const FVector Loc = DesiredCenter - Rot.RotateVector(FVector(MeshBounds.Origin) * Scale);
+		Transforms.Emplace(Rot, Loc, Scale);
+	};
+
+	// 북쪽 벽: 행마다 X 방향 연속 구간을 병합(끊기거나 MaxRun 도달 시 방출).
+	for (int32 Y = 0; Y < GridHeight; ++Y)
+	{
+		for (int32 X = 0; X < GridWidth; )
+		{
+			if (!(Cells[Index(X, Y)] & Wall_North)) { ++X; continue; }
+			const int32 Xs = X;
+			while (X < GridWidth && (Cells[Index(X, Y)] & Wall_North) && (X - Xs) < MaxRun) { ++X; }
+			const int32 L = X - Xs; // 구간 = 셀 [Xs, X-1].
+			EmplaceRun(FVector((Xs + X - 1) * 0.5f * CellSize, Y * CellSize + HalfCell, ZCenter), L, 0.f);
+		}
+	}
+	// 동쪽 벽: 열마다 Y 방향 연속 구간을 병합.
+	for (int32 X = 0; X < GridWidth; ++X)
+	{
+		for (int32 Y = 0; Y < GridHeight; )
+		{
+			if (!(Cells[Index(X, Y)] & Wall_East)) { ++Y; continue; }
+			const int32 Ys = Y;
+			while (Y < GridHeight && (Cells[Index(X, Y)] & Wall_East) && (Y - Ys) < MaxRun) { ++Y; }
+			const int32 L = Y - Ys;
+			EmplaceRun(FVector(X * CellSize + HalfCell, (Ys + Y - 1) * 0.5f * CellSize, ZCenter), L, 90.f);
+		}
+	}
+	// 남쪽 테두리(Y==0 행): 인접 셀 북벽과 중복 없는 경계 — X 방향 병합.
+	{
+		const int32 Y = 0;
+		for (int32 X = 0; X < GridWidth; )
+		{
+			if (!(Cells[Index(X, Y)] & Wall_South)) { ++X; continue; }
+			const int32 Xs = X;
+			while (X < GridWidth && (Cells[Index(X, Y)] & Wall_South) && (X - Xs) < MaxRun) { ++X; }
+			const int32 L = X - Xs;
+			EmplaceRun(FVector((Xs + X - 1) * 0.5f * CellSize, -HalfCell, ZCenter), L, 0.f);
+		}
+	}
+	// 서쪽 테두리(X==0 열): Y 방향 병합.
+	{
+		const int32 X = 0;
+		for (int32 Y = 0; Y < GridHeight; )
+		{
+			if (!(Cells[Index(X, Y)] & Wall_West)) { ++Y; continue; }
+			const int32 Ys = Y;
+			while (Y < GridHeight && (Cells[Index(X, Y)] & Wall_West) && (Y - Ys) < MaxRun) { ++Y; }
+			const int32 L = Y - Ys;
+			EmplaceRun(FVector(-HalfCell, (Ys + Y - 1) * 0.5f * CellSize, ZCenter), L, 90.f);
+		}
+	}
+
+	if (Transforms.Num() > 0)
+	{
+		FarWallISM->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/false);
+	}
+	FarWallISM->SetVisibility(true, true);
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 원거리 벽 %d개(병합 상한 %d셀, 축소 %.2f)."),
+		FarWallISM->GetInstanceCount(), MaxRun, FarWallShrink);
+}
+
+void AMazeGenerator::BuildFarFloor()
+{
+	if (!bFarFloor || !FarFloorISM || !FloorStaticMesh || Cells.Num() == 0)
+	{
+		return;
+	}
+	FarFloorISM->ClearInstances();
+	FarFloorISM->SetStaticMesh(FloorStaticMesh);
+	if (UMaterialInterface* Mat = FarFloorMaterial ? FarFloorMaterial.Get() : FloorMaterial.Get())
+	{
+		Mat->CheckMaterialUsage(EMaterialUsage::MATUSAGE_InstancedStaticMeshes);
+		FarFloorISM->SetMaterial(0, Mat);
+	}
+
+	// BuildFloorInWindow와 같은 슬래브 계산을 슈퍼타일 크기로 확장. 상판을 z=-2cm로 내려 근거리 바닥이 항상 위.
+	const FBoxSphereBounds B = FloorStaticMesh->GetBounds();
+	const float MeshX = B.BoxExtent.X * 2.f;
+	const float MeshY = B.BoxExtent.Y * 2.f;
+	const float MeshZ = B.BoxExtent.Z * 2.f;
+	constexpr float TileThickness = 10.f;
+	constexpr float TopZ = -2.f;
+	const float ScaleZ = (MeshZ > KINDA_SMALL_NUMBER) ? TileThickness / MeshZ : 1.f;
+	const float TileZ = TopZ - (B.Origin.Z + B.BoxExtent.Z) * ScaleZ;
+
+	const int32 TileCells = FMath::Max(1, FarFloorTileCells);
+	TArray<FTransform> Transforms;
+	Transforms.Reserve(FMath::DivideAndRoundUp(GridWidth, TileCells) * FMath::DivideAndRoundUp(GridHeight, TileCells));
+	for (int32 Y0 = 0; Y0 < GridHeight; Y0 += TileCells)
+	{
+		for (int32 X0 = 0; X0 < GridWidth; X0 += TileCells)
+		{
+			// 가장자리 슈퍼타일은 격자에 맞게 줄인다.
+			const int32 W = FMath::Min(TileCells, GridWidth - X0);
+			const int32 H = FMath::Min(TileCells, GridHeight - Y0);
+			const FVector Scale(
+				(MeshX > KINDA_SMALL_NUMBER) ? (W * CellSize) / MeshX : 1.f,
+				(MeshY > KINDA_SMALL_NUMBER) ? (H * CellSize) / MeshY : 1.f,
+				ScaleZ);
+			Transforms.Emplace(FQuat::Identity,
+				FVector((X0 + (W - 1) * 0.5f) * CellSize, (Y0 + (H - 1) * 0.5f) * CellSize, TileZ), Scale);
+		}
+	}
+	if (Transforms.Num() > 0)
+	{
+		FarFloorISM->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/false);
+	}
+	FarFloorISM->SetVisibility(true, true);
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 원거리 바닥 슈퍼타일 %d개(%d셀 간격)."), FarFloorISM->GetInstanceCount(), TileCells);
+}
+
+void AMazeGenerator::SetFarLayerVisible(bool bVisible)
+{
+	if (FarWallISM)
+	{
+		FarWallISM->SetVisibility(bVisible, true);
+	}
+	if (FarFloorISM)
+	{
+		FarFloorISM->SetVisibility(bVisible, true);
+	}
 }
 
 void AMazeGenerator::ApplyWorldCurve()
@@ -1031,6 +1447,17 @@ void AMazeGenerator::EnsureShiftFog()
 		C->SetFogMaxOpacity(FogMaxOpacity);
 		// 방향성 산란(태양빛 줄무늬) 제거 — 어둠 분위기 유지.
 		C->SetDirectionalInscatteringColor(FLinearColor::Black);
+		// 천장 안개: 2차 레이어를 벽 위쪽에 얹어 위를 볼 때만 더 짙게(수평 시야 밀도와 독립).
+		if (bCeilingFog)
+		{
+			C->SetSecondFogDensity(CeilingFogDensity);
+			C->SetSecondFogHeightOffset(CeilingFogHeightOffset);
+			C->SetSecondFogHeightFalloff(CeilingFogHeightFalloff);
+		}
+		else
+		{
+			C->SetSecondFogDensity(0.f); // 레벨의 기존 fog를 재사용할 수 있어 잔존값을 명시적으로 끈다.
+		}
 	}
 	ShiftFog = Fog;
 	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: ShiftFog ready (density=%.3f falloff=%.3f start=%.0f color=(%.3f,%.3f,%.3f))."),
@@ -1661,6 +2088,9 @@ void AMazeGenerator::HandleGoalCleared()
 	BuildWallsInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
 	LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
 
+	// 원거리 레이어 숨김 — 위의 전체 렌더가 다 그리므로 중복이고, 열리는 벽 뒤에 유령 벽이 남는 것도 방지.
+	SetFarLayerVisible(false);
+
 	// --- 연출 상태 초기화 ---
 	Segments.Reset();
 	OpenedWallCount = 0;
@@ -2032,6 +2462,8 @@ void AMazeGenerator::ResetFinaleToPreClear()
 	CarveRooms();
 	LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
 	UpdateRenderWindow();
+	// 데이터가 원본과 동일하게 복구됨 → 기존 원거리 인스턴스가 그대로 유효(리빌드 불필요), 표시만 복원.
+	SetFarLayerVisible(true);
 	if (World)
 	{
 		World->GetTimerManager().SetTimer(WindowTimer, this, &AMazeGenerator::UpdateRenderWindow,
@@ -2072,12 +2504,23 @@ void AMazeGenerator::RespawnAtGoal()
 
 	APlayerController* PC = World->GetFirstPlayerController();
 
-	// 플레이어를 목표 방으로 이동.
+	// 플레이어를 목표 방으로 이동 + 목표지점을 바라보게(열쇠 재삽입 대상이 첫 화면에 보이도록).
 	if (PC)
 	{
 		if (APawn* Pawn = PC->GetPawn())
 		{
 			Pawn->SetActorLocation(FinaleStartWorld, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+			for (TActorIterator<AGoalPoint> It(World); It; ++It)
+			{
+				if (AGoalPoint* Goal = *It; Goal && Goal->bPlaceInMazeRoom)
+				{
+					FRotator Face = (Goal->GetActorLocation() - FinaleStartWorld).Rotation();
+					Face.Pitch = 0.f;
+					Face.Roll = 0.f;
+					PC->SetControlRotation(Face);
+					break;
+				}
+			}
 		}
 	}
 
