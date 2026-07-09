@@ -101,6 +101,16 @@ AMazeGenerator::AMazeGenerator()
 	FarFloorISM->SetCastShadow(false);
 	FarFloorISM->SetCanEverAffectNavigation(false);
 
+	// 외곽 성벽(테두리) ISM — 미로 둘레 큰 박스 몇 개. 충돌 O(못 넘어감), 인스턴스는 BuildBorderWall이 1회 추가.
+	BorderWallISM = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("BorderWallISM"));
+	BorderWallISM->SetupAttachment(WallISM);
+	BorderWallISM->SetCollisionProfileName(TEXT("BlockAll"));
+	BorderWallISM->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	if (CubeMesh.Succeeded())
+	{
+		BorderWallISM->SetStaticMesh(CubeMesh.Object);
+	}
+
 	// 원거리 전용 머티리얼(텍스처 없는 값싼 것 + 동일 커브 WPO). 애셋이 아직 없으면 폴백으로 동작(프로젝트 관례).
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> FarWallMatAsset(TEXT("/Game/Maze/M_MazeWallFar.M_MazeWallFar"));
 	if (FarWallMatAsset.Succeeded())
@@ -129,11 +139,38 @@ AMazeGenerator::AMazeGenerator()
 	StartRamp->SetCollisionProfileName(TEXT("BlockAll"));
 	StartRamp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	StartRamp->SetVisibility(false);
+
+	// 시작 통로 터널(입구 앞 덮인 구간): 천장 + 좌/우 측벽. 런타임 BuildStartZone이 배치 → 평소엔 숨김.
+	StartCeiling = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartCeiling"));
+	StartCeiling->SetupAttachment(WallISM);
+	StartCeiling->SetCollisionProfileName(TEXT("BlockAll"));
+	StartCeiling->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartCeiling->SetVisibility(false);
+	StartCorridorWallLeft = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartCorridorWallLeft"));
+	StartCorridorWallLeft->SetupAttachment(WallISM);
+	StartCorridorWallLeft->SetCollisionProfileName(TEXT("BlockAll"));
+	StartCorridorWallLeft->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartCorridorWallLeft->SetVisibility(false);
+	StartCorridorWallRight = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartCorridorWallRight"));
+	StartCorridorWallRight->SetupAttachment(WallISM);
+	StartCorridorWallRight->SetCollisionProfileName(TEXT("BlockAll"));
+	StartCorridorWallRight->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartCorridorWallRight->SetVisibility(false);
+	StartCorridorBackWall = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("StartCorridorBackWall"));
+	StartCorridorBackWall->SetupAttachment(WallISM);
+	StartCorridorBackWall->SetCollisionProfileName(TEXT("BlockAll"));
+	StartCorridorBackWall->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	StartCorridorBackWall->SetVisibility(false);
+
 	if (CubeMesh.Succeeded())
 	{
 		StartGround->SetStaticMesh(CubeMesh.Object);
 		StartPlatform->SetStaticMesh(CubeMesh.Object);
 		StartRamp->SetStaticMesh(CubeMesh.Object);
+		StartCeiling->SetStaticMesh(CubeMesh.Object);
+		StartCorridorWallLeft->SetStaticMesh(CubeMesh.Object);
+		StartCorridorWallRight->SetStaticMesh(CubeMesh.Object);
+		StartCorridorBackWall->SetStaticMesh(CubeMesh.Object);
 	}
 }
 
@@ -160,6 +197,9 @@ void AMazeGenerator::BeginPlay()
 
 	// 시작 구역(미로 밖 마당+전망대) 배치 + 플레이어를 그 위로 순간이동(다음 틱 — 폰 소유가 우리 BeginPlay보다 늦을 수 있음).
 	BuildStartZone();
+
+	// 미로 바깥 둘레에 큰 외곽 성벽(테두리) 1회 배치. GenerateMaze(ClearMaze) 뒤라 지워지지 않는다.
+	BuildBorderWall();
 	if (bTeleportPlayerToStart && bStartZone)
 	{
 		StartPlaceRetries = 0;
@@ -177,6 +217,14 @@ void AMazeGenerator::BeginPlay()
 			bRecordInstanceMap = true;
 			BuildWallsInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
 			LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
+
+			// 성능: 시프트는 미로 전체를 항상 렌더(인덱스 안정성) → 안개로 이미 안 보이는 먼 벽까지 Draw/GPU를 태운다.
+			// 인스턴스는 그대로 두고 '렌더 거리 컬링'만 걸어(WallISM) 먼 인스턴스 렌더를 생략한다 → 애니/인덱스 불변, 시각 변화 0.
+			if (ShiftRenderDistance > 0.f && WallISM)
+			{
+				WallISM->SetCullDistances(
+					static_cast<int32>(ShiftRenderDistance * 0.85f), static_cast<int32>(ShiftRenderDistance));
+			}
 
 			// 연결성 가드 목표 셀 = 가장 먼 방 중심(없으면 반대편 코너). 경로 staircase의 도착점이기도 하다.
 			if (Rooms.Num() > 0)
@@ -210,7 +258,7 @@ void AMazeGenerator::BeginPlay()
 			}
 
 			// 시프트 안개: 천장 부재(하늘)와 X방향 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다.
-			EnsureShiftFog();
+			EnsureFog();
 
 			// 휘는 바닥: 셀 타일 ISM을 깔고 레벨 평면 바닥을 숨긴다(커브는 벽과 같은 머티리얼 WPO가 담당, 충돌은 숨긴 바닥 유지).
 			// 예전엔 전체 미로를 한 번에 깔았음(대형 격자 시작 히칭) → 이제 플레이어 창만 깔고 타이머로 따라간다.
@@ -226,6 +274,10 @@ void AMazeGenerator::BeginPlay()
 				}
 			}
 
+			// 시프트 최종 도착점 = 목표 방(키 꽂는 곳) 셀. 퍼즐을 다 풀면 여기로 인도한다.
+			ShiftFinalGoalCell = ShiftGoalCell;
+			ShiftCurrentTarget = FIntPoint(MIN_int32, MIN_int32); // 첫 UpdateShiftTarget이 강제로 경로를 빌드하도록.
+
 			// 선택: 목표 셀에 발광 비콘(어둠 속에서도 멀리 휘어 보이는 목표 마커).
 			if (bSpawnGoalBeacon && GoalBeaconClass)
 			{
@@ -235,7 +287,37 @@ void AMazeGenerator::BeginPlay()
 				World->SpawnActor<AActor>(GoalBeaconClass, BeaconLoc, GetActorRotation(), BParams);
 			}
 
-			return; // 시프트 모드에선 윈도우 타이머/피날레 구독을 쓰지 않는다(인덱스 보존 + 충돌 방지).
+			// 퍼즐 비콘: 각 퍼즐 방에 발광 기둥(어둠 속 멀리서 커브로 휘어 보이는 위치 표시). 해결되면 UpdateShiftTarget이 숨긴다.
+			ShiftPuzzleBeacons.Reset();
+			if (bSpawnPuzzleBeacons)
+			{
+				const TSubclassOf<AActor> BeaconCls = PuzzleBeaconClass ? PuzzleBeaconClass : GoalBeaconClass;
+				if (BeaconCls)
+				{
+					FActorSpawnParameters BParams;
+					BParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+					for (const FIntPoint& PCell : ShiftPuzzleCells)
+					{
+						const FVector BeaconLoc = GetCellCenterWorld(PCell.X, PCell.Y);
+						AActor* Beacon = World->SpawnActor<AActor>(BeaconCls, BeaconLoc, GetActorRotation(), BParams);
+						ShiftPuzzleBeacons.Add(Beacon); // 인덱스를 ShiftPuzzleCells와 병렬 유지(스폰 실패=null도 유지).
+					}
+				}
+			}
+
+			// 최종 엔딩: 시프트 모드에서도 목표 클리어 시 피날레(추격자+탈출극)를 발동하도록 구독.
+			if (bEnableFinale)
+			{
+				for (TActorIterator<AGoalPoint> It(World); It; ++It)
+				{
+					if (AGoalPoint* Goal = *It)
+					{
+						Goal->OnGoalCleared.AddDynamic(this, &AMazeGenerator::HandleGoalCleared);
+					}
+				}
+			}
+
+			return; // 시프트 모드에선 윈도우 타이머를 쓰지 않는다(인덱스 보존 + 충돌 방지). 피날레는 위에서 구독함.
 		}
 
 		// 일반/피날레 모드: 플레이어 주변만 렌더하는 윈도우를 주기적으로 갱신.
@@ -245,6 +327,10 @@ void AMazeGenerator::BeginPlay()
 		// 원거리 벽 레이어: 창 밖 하드 컷을 병합 HISM으로 채운다(1회 빌드, 창 이동과 무관).
 		// 시프트 모드는 전 벽이 개폐 애니 대상이라 전체 근거리 렌더를 유지 → 여기(일반 모드)에서만 깐다.
 		BuildFarWalls();
+
+		// 거리 안개: 줄인 렌더 거리(원거리 컷) 경계를 안개로 가려 자연스럽게 한다. bAutoFogFromRenderDistance면
+		// 시작거리·밀도를 원거리 컷 거리에서 자동 산출 → 렌더 거리를 줄이면 안개도 그만큼 앞당겨 짙어진다.
+		EnsureFog();
 
 		// 피날레: 레벨의 목표지점들이 클리어되면 미로 재배열 + 출구 생성을 시작하도록 구독.
 		if (bEnableFinale)
@@ -291,11 +377,13 @@ FIntPoint AMazeGenerator::GetStartCell() const
 void AMazeGenerator::BuildStartZone()
 {
 	// 런타임 전용. 미로 서쪽 '밖'(로컬 -X)에 자기완결 시작 구역을 세운다:
-	// [서쪽 끝] 전망대 단상 → 30° 경사로 → 마당 슬래브 → (+X로 걸으면) (0,0) 서쪽 테두리 입구.
+	// 기본(StartPlatformHeight=0) = 평지 마당 슬래브 + 천장/측벽/뒷벽으로 완전 밀폐된 통로 → (+X로 걸으면) (0,0) 서쪽 테두리 입구.
+	// StartPlatformHeight>0이면 서쪽 끝에 전망대 단상 + 30° 경사로가 추가된다(선택).
 	// 마당에 자체 바닥 슬래브를 두는 이유: 레벨 바닥(Floor_0)의 범위에 의존하지 않기 위해(대형 미로/이동 배치에도 안전).
 	auto HideAll = [this]()
 	{
-		for (UStaticMeshComponent* C : { StartGround.Get(), StartPlatform.Get(), StartRamp.Get() })
+		for (UStaticMeshComponent* C : { StartGround.Get(), StartPlatform.Get(), StartRamp.Get(),
+			StartCeiling.Get(), StartCorridorWallLeft.Get(), StartCorridorWallRight.Get(), StartCorridorBackWall.Get() })
 		{
 			if (C) { C->SetVisibility(false); C->SetCollisionEnabled(ECollisionEnabled::NoCollision); }
 		}
@@ -324,8 +412,10 @@ void AMazeGenerator::BuildStartZone()
 	const float Run = (StartPlatformHeight > 0.f)
 		? StartPlatformHeight / FMath::Tan(FMath::DegreesToRadians(RampAngleDeg))
 		: 0.f;
-	// 마당 깊이(서쪽 방향) = 단상 + 경사로 런 + 여유. 평지 시작(높이 0)이어도 최소 3셀은 확보.
-	const float ZoneDepth = FMath::Max(PlatSize + Run + YardMargin, CellSize * 3.f);
+	// 마당 깊이(서쪽 방향) = 단상 + 경사로 런 + 여유 + 덮인 통로. 평지 시작(높이 0)이어도 최소 3셀은 확보.
+	// StartCorridorLength만큼 더해 시작 구역과 입구 사이 통로를 길게 만든다(입구 앞 구간을 터널로 덮음).
+	const float CorridorLen = FMath::Max(StartCorridorLength, 0.f);
+	const float ZoneDepth = FMath::Max(PlatSize + Run + YardMargin, CellSize * 3.f) + CorridorLen;
 
 	// 마당 슬래브: X [-HalfCell-ZoneDepth, -HalfCell], Y [-1.5셀, +1.5셀](입구 셀 (0,0) 폭을 가운데 포함), 상판 z=0.
 	const float YardMinX = -HalfCell - ZoneDepth;
@@ -338,6 +428,52 @@ void AMazeGenerator::BuildStartZone()
 
 	// 스폰 폴백(단상 없음) 지점 = 마당 중앙.
 	StartYardCenterLocal = FVector(YardMinX + ZoneDepth * 0.5f, 0.f, 0.f);
+
+	// 시작 구역 '전체' 밀폐: 천장 + 좌우 측벽 + 뒷벽으로 덮어 위/옆/뒤로 하늘(및 곡면)을 못 보게 한다.
+	// 전망대 유무와 무관하므로 평지 early-return 전에 배치. Y=0 중심 = 입구 셀 (0,0) 정렬.
+	if (bStartCorridorRoof && StartCeiling && StartCorridorWallLeft && StartCorridorWallRight && StartCorridorBackWall)
+	{
+		const float CoverMinX = YardMinX;                       // 서쪽 끝(마당 끝).
+		const float CoverLen = -HalfCell - YardMinX;            // = ZoneDepth (마당 전체 길이).
+		const float CoverCenterX = CoverMinX + CoverLen * 0.5f;
+		const float CorrHalfWidth = CellSize * 0.75f;           // 내부 반폭(입구 1셀을 여유 있게 감싸는 복도).
+		constexpr float RoofThickness = 30.f;
+		constexpr float SideWallThickness = 30.f;
+		const float OuterHalfY = CorrHalfWidth + SideWallThickness; // 천장/뒷벽이 측벽 바깥까지 덮도록.
+
+		// 천장(구역 전체 덮개): 상판 z=StartCorridorHeight(바닥 z=0 기준), 두께 위로. 폭은 측벽 바깥까지.
+		const FVector CeilCenter(CoverCenterX, 0.f, StartCorridorHeight + RoofThickness * 0.5f);
+		const FVector CeilScale(CoverLen / SX, OuterHalfY * 2.f / SY, RoofThickness / SZ);
+		StartCeiling->SetRelativeTransform(FTransform(FQuat::Identity, CeilCenter - FVector(MB.Origin) * CeilScale, CeilScale));
+		StartCeiling->SetVisibility(true);
+		StartCeiling->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+		// 좌/우 측벽(구역 전체 길이): 높이 StartCorridorHeight, 내부 반폭 바깥에 배치.
+		auto PlaceSideWall = [&](UStaticMeshComponent* W, float SignY)
+		{
+			const FVector WCenter(CoverCenterX, SignY * (CorrHalfWidth + SideWallThickness * 0.5f), StartCorridorHeight * 0.5f);
+			const FVector WScale(CoverLen / SX, SideWallThickness / SY, StartCorridorHeight / SZ);
+			W->SetRelativeTransform(FTransform(FQuat::Identity, WCenter - FVector(MB.Origin) * WScale, WScale));
+			W->SetVisibility(true);
+			W->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		};
+		PlaceSideWall(StartCorridorWallLeft, -1.f);
+		PlaceSideWall(StartCorridorWallRight, +1.f);
+
+		// 뒷벽: 서쪽 끝을 막아 뒤로도 하늘이 안 보이게 완전 밀폐(높이 StartCorridorHeight, 폭은 측벽 바깥까지).
+		const FVector BackCenter(CoverMinX - SideWallThickness * 0.5f, 0.f, StartCorridorHeight * 0.5f);
+		const FVector BackScale(SideWallThickness / SX, OuterHalfY * 2.f / SY, StartCorridorHeight / SZ);
+		StartCorridorBackWall->SetRelativeTransform(FTransform(FQuat::Identity, BackCenter - FVector(MB.Origin) * BackScale, BackScale));
+		StartCorridorBackWall->SetVisibility(true);
+		StartCorridorBackWall->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+	}
+	else
+	{
+		for (UStaticMeshComponent* C : { StartCeiling.Get(), StartCorridorWallLeft.Get(), StartCorridorWallRight.Get(), StartCorridorBackWall.Get() })
+		{
+			if (C) { C->SetVisibility(false); C->SetCollisionEnabled(ECollisionEnabled::NoCollision); }
+		}
+	}
 
 	if (StartPlatformHeight <= 0.f)
 	{
@@ -373,6 +509,103 @@ void AMazeGenerator::BuildStartZone()
 
 	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 시작 구역 배치 — 마당 깊이 %.0fcm, 전망대 %.0fcm, 경사로 런 %.0fcm."),
 		ZoneDepth, StartPlatformHeight, Run);
+}
+
+void AMazeGenerator::BuildBorderWall()
+{
+	// 런타임 전용. 미로 바깥 둘레에 크고 높은 외곽 성벽(테두리)을 큰 박스 몇 개(엔진 큐브)로 두른다.
+	// 시작 구역(서쪽 (0,0) 입구)만 트이도록 서쪽 벽은 입구 폭만큼 갈라 둔다.
+	// ClearMaze는 BorderWallISM을 지우지 않으므로(창 갱신에 유지) 여기서 1회만 채운다.
+	if (!BorderWallISM)
+	{
+		return;
+	}
+	BorderWallISM->ClearInstances(); // 재진입 대비 idempotent.
+
+	const bool bWant = GetWorld() && GetWorld()->IsGameWorld() && bBorderWall && BorderWallISM->GetStaticMesh();
+	if (!bWant)
+	{
+		return;
+	}
+
+	// 머티리얼: 지정 → 원거리 벽 머티리얼 → 메시 기본 순 폴백.
+	if (BorderWallMaterial)
+	{
+		BorderWallISM->SetMaterial(0, BorderWallMaterial);
+	}
+	else if (FarWallMaterial)
+	{
+		BorderWallISM->SetMaterial(0, FarWallMaterial);
+	}
+
+	// 박스 크기 산출용 메시 실제 바운드(엔진 큐브=100cm 가정하지 않음 — 다른 메시를 꽂아도 동작).
+	const FBoxSphereBounds MB = BorderWallISM->GetStaticMesh()->GetBounds();
+	const FVector MeshSize = MB.BoxExtent * 2.0;
+	const double MSX = FMath::Max(MeshSize.X, static_cast<double>(UE_KINDA_SMALL_NUMBER));
+	const double MSY = FMath::Max(MeshSize.Y, static_cast<double>(UE_KINDA_SMALL_NUMBER));
+	const double MSZ = FMath::Max(MeshSize.Z, static_cast<double>(UE_KINDA_SMALL_NUMBER));
+
+	const float HalfCell = CellSize * 0.5f;
+	const float T = FMath::Max(BorderWallThickness, 1.f);
+	const float H = FMath::Max(BorderWallHeight, 1.f);
+	const float M = FMath::Max(BorderWallMargin, 0.f);
+
+	// 미로 바깥 가장자리(외벽 반 셀 포함) + 여백 = 성벽 '안쪽 면' 링.
+	const float InMinX = -HalfCell - M;
+	const float InMaxX = (GridWidth - 1) * CellSize + HalfCell + M;
+	const float InMinY = -HalfCell - M;
+	const float InMaxY = (GridHeight - 1) * CellSize + HalfCell + M;
+
+	// 박스 인스턴스 하나를 (로컬 중심 X,Y, 전체 크기 Lx,Ly)로 추가. 높이는 항상 바닥 z=0에서 위로 H.
+	auto AddBox = [&](float Cx, float Cy, float Lx, float Ly)
+	{
+		const FVector Scale(Lx / MSX, Ly / MSY, H / MSZ);
+		const FVector Center(Cx, Cy, H * 0.5f);
+		const FVector Loc = Center - FVector(MB.Origin) * Scale; // 비중앙 피벗 보정.
+		BorderWallISM->AddInstance(FTransform(FQuat::Identity, Loc, Scale), /*bWorldSpace=*/false);
+	};
+
+	const float MidX = (InMinX + InMaxX) * 0.5f;
+	const float MidY = (InMinY + InMaxY) * 0.5f;
+	const float SpanX = (InMaxX - InMinX) + 2.f * T; // 북/남은 모서리 밖까지 덮어 코너를 채운다.
+	const float SpanY = (InMaxY - InMinY);            // 동/서는 남북 벽 사이(코너는 북/남이 담당).
+
+	// 북(+Y) · 남(-Y): 전체 폭 + 코너.
+	AddBox(MidX, InMaxY + T * 0.5f, SpanX, T);
+	AddBox(MidX, InMinY - T * 0.5f, SpanX, T);
+	// 동(+X).
+	AddBox(InMaxX + T * 0.5f, MidY, T, SpanY);
+
+	// 서(-X): 시작 입구(bStartZone)가 있으면 입구 폭만큼 갈라 두 조각, 없으면 통짜.
+	const float WestX = InMinX - T * 0.5f;
+	if (bStartZone)
+	{
+		// 입구는 (0,0) 서쪽, 로컬 Y=0. 시작 통로 반폭(0.75셀)보다 넉넉히(0.9셀) 벌려 통행 보장.
+		const float GapHalf = CellSize * 0.9f;
+		const float SouthLen = FMath::Max(-GapHalf - InMinY, 0.f); // InMinY .. -GapHalf
+		const float NorthLen = FMath::Max(InMaxY - GapHalf, 0.f);  // GapHalf .. InMaxY
+		if (SouthLen > 1.f) { AddBox(WestX, (InMinY - GapHalf) * 0.5f, T, SouthLen); }
+		if (NorthLen > 1.f) { AddBox(WestX, (GapHalf + InMaxY) * 0.5f, T, NorthLen); }
+
+		// 입구 위 상인방(lintel): 갈라진 틈의 위쪽만 덮어 '나오는 곳 위'가 뚫리지 않게 한다(아래는 통행 높이만큼 열림).
+		// 통행 높이 = 시작 통로 천장 높이(있으면)와 맞춰 이음새 없이 이어지게. 성벽 전체 높이 H까지 위로 채운다.
+		const float GateHeight = FMath::Min(H - 1.f, bStartCorridorRoof ? StartCorridorHeight : WallHeight);
+		const float LintelH = H - GateHeight;
+		if (LintelH > 1.f)
+		{
+			const FVector LScale(T / MSX, (2.f * GapHalf) / MSY, LintelH / MSZ);
+			const FVector LCenter(WestX, 0.f, GateHeight + LintelH * 0.5f);
+			const FVector LLoc = LCenter - FVector(MB.Origin) * LScale;
+			BorderWallISM->AddInstance(FTransform(FQuat::Identity, LLoc, LScale), /*bWorldSpace=*/false);
+		}
+	}
+	else
+	{
+		AddBox(WestX, MidY, T, SpanY);
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: 외곽 성벽 배치 — 높이 %.0fcm, 두께 %.0fcm, 여백 %.0fcm, 인스턴스 %d개."),
+		H, T, M, BorderWallISM->GetInstanceCount());
 }
 
 void AMazeGenerator::PlacePlayerAtStart()
@@ -421,6 +654,15 @@ void AMazeGenerator::DistributeRoomActors()
 	const int32 GoalRoom = GetGoalRoomIndex();
 	const FRotator MazeRot = GetActorRotation();
 
+	// 시프트 인도용: 퍼즐 방의 중심 셀 + 액터를 기록(경로 동적 재타겟팅에 사용).
+	ShiftPuzzleCells.Reset();
+	ShiftPuzzles.Reset();
+	auto RoomCenterCell = [this](int32 RoomIdx) -> FIntPoint
+	{
+		const FIntRect& R = Rooms[RoomIdx];
+		return FIntPoint((R.Min.X + R.Max.X - 1) / 2, (R.Min.Y + R.Max.Y - 1) / 2);
+	};
+
 	// 목표지점들 → 가장 먼 방.
 	for (TActorIterator<AGoalPoint> It(World); It; ++It)
 	{
@@ -456,6 +698,8 @@ void AMazeGenerator::DistributeRoomActors()
 
 		Puzzle->SetActorLocation(GetRoomCenterWorld(RoomCursor));
 		Puzzle->SetActorRotation(MazeRot);
+		ShiftPuzzleCells.Add(RoomCenterCell(RoomCursor));
+		ShiftPuzzles.Add(Puzzle);
 		++RoomCursor;
 		++PlacedPuzzles;
 	}
@@ -913,9 +1157,10 @@ void AMazeGenerator::BuildFarWalls()
 		FarWallMaterial->CheckMaterialUsage(EMaterialUsage::MATUSAGE_InstancedStaticMeshes);
 		FarWallISM->SetMaterial(0, FarWallMaterial);
 	}
-	if (FarCullDistance > 0.f)
+	const float FarCull = GetEffectiveFarCullDistance();
+	if (FarCull > 0.f)
 	{
-		FarWallISM->SetCullDistances(static_cast<int32>(FarCullDistance * 0.85f), static_cast<int32>(FarCullDistance));
+		FarWallISM->SetCullDistances(static_cast<int32>(FarCull * 0.85f), static_cast<int32>(FarCull));
 	}
 
 	// 스케일 규칙은 GetWallMeshScaling과 동일하되, 길이는 병합 구간(L셀)만큼 늘리고 전체를 FarWallShrink로 축소.
@@ -1220,14 +1465,17 @@ void AMazeGenerator::ShiftTick()
 	{
 		InitShiftRun();
 	}
+	// 매 사이클: 가장 가까운 미해결 퍼즐(없으면 목표)로 척추를 재조준 + 해결된 퍼즐 비콘 숨김.
+	UpdateShiftTarget(PlayerLoc);
 	if (RouteCells.Num() < 2)
 	{
-		return; // 경로가 없으면(예: 시작==목표) 시프트 대상 없음.
+		return; // 경로가 없으면(예: 시작==목표=현재 셀) 시프트 대상 없음.
 	}
 
 	const FIntPoint P = GetPlayerCell();
 	const float DrawZ = WallHeight * 0.5f;
 	const float FreezeRSq = FreezeRadius * FreezeRadius;
+	const float InnerRSq = ShiftInnerRadius * ShiftInnerRadius; // 근접 안정 구역(더 멀리서 시프트되게).
 
 	// 플레이어의 경로상 진행 인덱스 = 가장 가까운 경로 셀(앞/뒤를 경로 기준으로 가른다).
 	int32 PlayerRouteIdx = 0;
@@ -1245,6 +1493,7 @@ void AMazeGenerator::ShiftTick()
 	{
 		if (A == P || B == P) { return false; }                                  // 코앞 간선 고정(끼임 방지).
 		if (FVector::DistSquaredXY(PlayerLoc, Mid) < FreezeRSq) { return false; } // 얼림 반경 안.
+		if (FVector::DistSquaredXY(PlayerLoc, Mid) < InnerRSq) { return false; }  // 근접 안정 구역(코앞에서 안 바뀜).
 		if (IsPointObserved(Mid, CamLoc, CamFwd)) { return false; }              // 빛 안(관측) = 얼림.
 		const int64 K = EdgeKey(A, B);
 		if (K < 0 || AnimatedEdges.Contains(K)) { return false; }                // 이미 개폐 애니 중.
@@ -1410,13 +1659,30 @@ void AMazeGenerator::EnsureShiftFlashlight(APawn* Pawn)
 	Flashlight = Flash;
 }
 
-void AMazeGenerator::EnsureShiftFog()
+float AMazeGenerator::GetEffectiveFarCullDistance() const
+{
+	// '실제 벽 렌더 거리'(cm) — 원거리 벽이 컬링되는 거리이자 자동 안개가 불투명해질 목표 거리.
+	if (FarCullDistance > 0.f)
+	{
+		return FarCullDistance; // 수동 지정 우선.
+	}
+	if (bAutoFarCull)
+	{
+		// 근거리 윈도우 가장자리(RenderRadiusCells)보다 살짝(≈1.15배) 밖에서 컷 → 근/원 이음새 뒤에서 끊긴다.
+		return RenderRadiusCells * CellSize * 1.15f;
+	}
+	return 0.f; // 무제한(예전 동작).
+}
+
+void AMazeGenerator::EnsureFog()
 {
 	// 안개: 코드로 ExponentialHeightFog를 1회 스폰(BP 불필요). 손전등과 짝이 되어 어둠 속 시야를 반경 안에 가둔다.
 	// 천장(Z): FogHeightFalloff를 작게 줘 위쪽까지 안개가 고르게 차오르고, 하늘(무한 거리)은 MaxOpacity로 완전히 덮인다.
 	// 수평(X/Y): 안개가 거리 비례로 누적되므로 StartDistance 너머 먼 벽이 자연스럽게 페이드된다.
 	UWorld* World = GetWorld();
-	if (!bShiftFog || ShiftFog.IsValid() || !World)
+	// 모드별 게이트: 시프트=bShiftFog(손전등 반경), 일반=bNormalFog(줄인 렌더 거리 은폐).
+	const bool bWantFog = bShiftMode ? bShiftFog : bNormalFog;
+	if (!bWantFog || ShiftFog.IsValid() || !World)
 	{
 		return;
 	}
@@ -1437,13 +1703,29 @@ void AMazeGenerator::EnsureShiftFog()
 	{
 		return;
 	}
+	// 안개 밀도·시작거리 결정: 기본은 수동값(FogDensity/FogStartDistance).
+	// 일반 모드 + bAutoFogFromRenderDistance면 '실제 벽 렌더 거리'에서 자동 산출 → 렌더 거리를 줄이면
+	// 안개가 그만큼 앞당겨 짙어져 컷 경계가 항상 안개 뒤에 숨는다.
+	float UseDensity = FogDensity;
+	float UseStart = FogStartDistance;
+	if (!bShiftMode && bAutoFogFromRenderDistance)
+	{
+		const float FarCull = GetEffectiveFarCullDistance();
+		// FarCull이 0(무제한)이면 근거리 윈도우 가장자리를 기준으로.
+		const float FadeDist = (FarCull > 0.f) ? FarCull : RenderRadiusCells * CellSize;
+		UseStart = FadeDist * 0.25f;                        // 이 거리까지는 맑고, 이후 서서히 짙어진다.
+		const float OpaqueDist = FadeDist * 0.85f;          // 컷보다 살짝 안쪽에서 사실상 불투명(97%)해지게.
+		const float Span = FMath::Max(OpaqueDist - UseStart, 100.f);
+		UseDensity = 3.5f / Span;                           // exp(-density*Span)≈0.03 → 97% 불투명. (지수 안개, 거리=cm.)
+	}
+
 	if (UExponentialHeightFogComponent* C = Fog->GetComponent())
 	{
-		// 모든 파라미터는 디테일 패널 'Maze|Fog'에서 조정 가능(여기선 그 값을 적용만).
-		C->SetFogDensity(FogDensity);
+		// 대부분 파라미터는 디테일 패널 'Maze|Fog'에서 조정 가능(여기선 그 값을 적용만).
+		C->SetFogDensity(UseDensity);
 		C->SetFogHeightFalloff(FogHeightFalloff);
 		C->SetFogInscatteringColor(FogColor);
-		C->SetStartDistance(FogStartDistance);
+		C->SetStartDistance(UseStart);
 		C->SetFogMaxOpacity(FogMaxOpacity);
 		// 방향성 산란(태양빛 줄무늬) 제거 — 어둠 분위기 유지.
 		C->SetDirectionalInscatteringColor(FLinearColor::Black);
@@ -1460,8 +1742,8 @@ void AMazeGenerator::EnsureShiftFog()
 		}
 	}
 	ShiftFog = Fog;
-	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: ShiftFog ready (density=%.3f falloff=%.3f start=%.0f color=(%.3f,%.3f,%.3f))."),
-		FogDensity, FogHeightFalloff, FogStartDistance, FogColor.R, FogColor.G, FogColor.B);
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: Fog ready (mode=%s density=%.4f start=%.0f farCull=%.0f)."),
+		bShiftMode ? TEXT("Shift") : TEXT("Normal"), UseDensity, UseStart, GetEffectiveFarCullDistance());
 }
 
 int32 AMazeGenerator::RepairConnectivityToGoal(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd)
@@ -1603,24 +1885,17 @@ void AMazeGenerator::DrawShiftDebug(FIntPoint PlayerCell, const FVector& CamLoc,
 	}
 }
 
-void AMazeGenerator::InitShiftRun()
+void AMazeGenerator::BuildRouteTo(FIntPoint Goal)
 {
-	// 플레이어 시작 셀 → 목표 셀(ShiftGoalCell)까지의 단조 staircase 경로를 만든다(피날레 경로 산출과 동형).
-	// 이 경로가 시프트의 '척추' — 앞쪽 경로 간선을 열고(전진 유도), 지나온 경로 셀의 옆 간선을 닫는다(백트래킹 봉인).
-	bShiftActive = true;
-
+	// 현재 플레이어 셀 → Goal까지 단조 staircase 경로(척추)를 재구성한다. RouteCells/RouteEdgeSet만 갱신하고
+	// 진행 중 애니(ActiveAnims/AnimatedEdges/FreedWallPool)는 건드리지 않는다(재타겟팅이 개폐 애니를 끊지 않게).
 	RouteCells.Reset();
 	RouteEdgeSet.Reset();
-	AnimatedEdges.Reset();
-	ActiveAnims.Reset();
-	FreedWallPool.Reset();
-	OpenedWallCount = 0;
-	FinaleStream = FRandomStream(Seed ^ 0x2545F491); // 개폐 방식(Slide/SwingDoor) 선택용.
 
 	const FIntPoint Start = GetPlayerCell();
-	const FIntPoint Goal = bShiftGoalValid ? ShiftGoalCell : FIntPoint(GridWidth - 1, GridHeight - 1);
-
-	FRandomStream Stream(Seed ^ 0x5BD1E995);
+	// 타겟별로 경로가 달라지게 Goal을 시드에 섞는다(같은 Goal이면 결정론 유지). 부호 오버플로 UB 방지 위해 unsigned 연산.
+	const int32 GoalSalt = static_cast<int32>(static_cast<uint32>(Goal.X) * 73856093u ^ static_cast<uint32>(Goal.Y) * 19349663u);
+	FRandomStream Stream(Seed ^ 0x5BD1E995 ^ GoalSalt);
 	FIntPoint Cur = Start;
 	RouteCells.Add(Cur);
 	int32 Guard = (GridWidth + GridHeight) * 2 + 4;
@@ -1642,10 +1917,71 @@ void AMazeGenerator::InitShiftRun()
 		const int64 K = EdgeKey(RouteCells[i], RouteCells[i + 1]);
 		if (K >= 0) { RouteEdgeSet.Add(K); }
 	}
+}
+
+void AMazeGenerator::UpdateShiftTarget(const FVector& PlayerLoc)
+{
+	// 해결된 퍼즐의 비콘을 숨긴다(피드백). 인도 여부와 무관하게 항상 수행.
+	for (int32 i = 0; i < ShiftPuzzles.Num(); ++i)
+	{
+		const ASlidingTilePuzzle* Pz = ShiftPuzzles[i].Get();
+		if (Pz && Pz->HasBeenSolved() && ShiftPuzzleBeacons.IsValidIndex(i))
+		{
+			if (AActor* B = ShiftPuzzleBeacons[i].Get(); B && !B->IsHidden())
+			{
+				B->SetActorHiddenInGame(true);
+			}
+		}
+	}
+
+	if (!bShiftGuideToPuzzles)
+	{
+		return; // 정적 목표 인도(기존 동작) — 척추는 InitShiftRun이 정한 목표로 고정.
+	}
+
+	// 타겟 = 현재 플레이어 위치에서 가장 가까운 '미해결' 퍼즐. 전부 해결됐으면 최종 목표(키 꽂는 곳).
+	FIntPoint Desired = ShiftFinalGoalCell;
+	double Best = TNumericLimits<double>::Max();
+	for (int32 i = 0; i < ShiftPuzzles.Num(); ++i)
+	{
+		const ASlidingTilePuzzle* Pz = ShiftPuzzles[i].Get();
+		if (!Pz || Pz->HasBeenSolved() || !ShiftPuzzleCells.IsValidIndex(i)) { continue; }
+		const FIntPoint Cell = ShiftPuzzleCells[i];
+		const double D = FVector::DistSquaredXY(PlayerLoc, GetCellCenterWorld(Cell.X, Cell.Y));
+		if (D < Best) { Best = D; Desired = Cell; }
+	}
+
+	// 타겟이 바뀌었으면 척추를 재조준(뒤쪽은 close-behind가 봉인 → 자연스러운 되감기).
+	if (Desired != ShiftCurrentTarget)
+	{
+		ShiftGoalCell = Desired;   // 연결성 가드/복구(RepairConnectivityToGoal)도 현재 타겟을 따라간다.
+		bShiftGoalValid = true;
+		BuildRouteTo(Desired);
+		ShiftCurrentTarget = Desired;
+		UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: Shift 재타겟 → (%d,%d), route %d cells."),
+			Desired.X, Desired.Y, RouteCells.Num());
+	}
+}
+
+void AMazeGenerator::InitShiftRun()
+{
+	// 첫 ShiftTick 1회: 시프트 상태 초기화 + 초기 척추 경로 산출 + Tick 활성.
+	// 이후 매 사이클 UpdateShiftTarget이 가장 가까운 미해결 퍼즐로 척추를 재조준한다.
+	bShiftActive = true;
+
+	AnimatedEdges.Reset();
+	ActiveAnims.Reset();
+	FreedWallPool.Reset();
+	OpenedWallCount = 0;
+	FinaleStream = FRandomStream(Seed ^ 0x2545F491); // 개폐 방식(Slide/SwingDoor) 선택용.
+
+	const FIntPoint Goal = bShiftGoalValid ? ShiftGoalCell : FIntPoint(GridWidth - 1, GridHeight - 1);
+	BuildRouteTo(Goal);
+	ShiftCurrentTarget = Goal;
 
 	SetActorTickEnabled(true); // Tick이 개폐 애니(ActiveAnims)를 매 프레임 구동.
-	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: ShiftRun init — route %d cells, start(%d,%d)→goal(%d,%d)."),
-		RouteCells.Num(), Start.X, Start.Y, Goal.X, Goal.Y);
+	UE_LOG(LogTemp, Log, TEXT("AMazeGenerator: ShiftRun init — route %d cells, goal(%d,%d)."),
+		RouteCells.Num(), Goal.X, Goal.Y);
 }
 
 bool AMazeGenerator::WallWouldHitPlayer(FIntPoint C, FIntPoint N, const FVector& PlayerLoc) const
@@ -2022,6 +2358,15 @@ void AMazeGenerator::HandleGoalCleared()
 		return; // 이미 진행 중이거나 월드/데이터 없음.
 	}
 	bFinaleActive = true;
+
+	// 시프트 모드에서 클리어됐다면 시프트 사이클/바닥 창을 멈춘다(피날레 Tick과 충돌·이중 개폐 방지).
+	// bFinaleActive가 켜지면 ShiftTick은 자동 early-return하므로 데이터 경합은 없지만, 타이머는 명시적으로 정리.
+	if (bShiftMode)
+	{
+		World->GetTimerManager().ClearTimer(ShiftTimer);
+		World->GetTimerManager().ClearTimer(FloorTimer);
+		bShiftActive = false;
+	}
 
 	// 출구 셀 = 플레이어 현재 셀에서 가장 먼 격자 코너.
 	const FIntPoint P = GetPlayerCell();
@@ -2461,13 +2806,41 @@ void AMazeGenerator::ResetFinaleToPreClear()
 	CarveMaze();
 	CarveRooms();
 	LastWindowCenter = FIntPoint(MIN_int32, MIN_int32);
-	UpdateRenderWindow();
-	// 데이터가 원본과 동일하게 복구됨 → 기존 원거리 인스턴스가 그대로 유효(리빌드 불필요), 표시만 복원.
-	SetFarLayerVisible(true);
+
+	if (bShiftMode)
+	{
+		// 시프트 모드로 복귀: 전면 재렌더(인덱스 맵 재기록) + 시프트 사이클/바닥 창 재시작.
+		// 다음 ShiftTick가 InitShiftRun을 다시 돌려 척추를 새로 잡고, UpdateShiftTarget이 (남은) 목표로 인도한다.
+		bRecordInstanceMap = true;
+		BuildWallsInWindow(FIntPoint(GridWidth / 2, GridHeight / 2), FMath::Max(GridWidth, GridHeight));
+		bShiftActive = false;
+		ShiftCurrentTarget = FIntPoint(MIN_int32, MIN_int32);
+		if (World)
+		{
+			World->GetTimerManager().SetTimer(ShiftTimer, this, &AMazeGenerator::ShiftTick, ShiftInterval, /*bLoop=*/true);
+			if (bShiftCurvedFloor)
+			{
+				LastFloorCenter = FIntPoint(MIN_int32, MIN_int32);
+				UpdateFloorWindow();
+				World->GetTimerManager().SetTimer(FloorTimer, this, &AMazeGenerator::UpdateFloorWindow,
+					WindowUpdateInterval, /*bLoop=*/true);
+			}
+		}
+	}
+	else
+	{
+		UpdateRenderWindow();
+		// 데이터가 원본과 동일하게 복구됨 → 기존 원거리 인스턴스가 그대로 유효(리빌드 불필요), 표시만 복원.
+		SetFarLayerVisible(true);
+		if (World)
+		{
+			World->GetTimerManager().SetTimer(WindowTimer, this, &AMazeGenerator::UpdateRenderWindow,
+				WindowUpdateInterval, /*bLoop=*/true);
+		}
+	}
+
 	if (World)
 	{
-		World->GetTimerManager().SetTimer(WindowTimer, this, &AMazeGenerator::UpdateRenderWindow,
-			WindowUpdateInterval, /*bLoop=*/true);
 
 		// 클리어됐던 목표지점을 '열쇠 보유·미클리어' 상태로 되돌린다.
 		for (TActorIterator<AGoalPoint> It(World); It; ++It)

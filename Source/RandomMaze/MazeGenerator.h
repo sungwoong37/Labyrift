@@ -15,6 +15,7 @@ class UStaticMeshComponent;
 class UStaticMesh;
 class AMazeExit;
 class AMazeChaser;
+class ASlidingTilePuzzle;
 class USpotLightComponent;
 class UCameraComponent;
 class APawn;
@@ -64,6 +65,28 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "1.0"))
 	float WallHeight = 400.f;
 
+	// --- 외곽 성벽(테두리) — 미로 바깥 둘레를 감싸는 크고 높은 벽. 시각/경계용. 서쪽 시작 입구만 트임. ---
+
+	/** 켜면 미로 바깥 둘레에 크고 높은 외곽 성벽(테두리)을 두른다. 시작 구역(서쪽 입구)만 트여 통행 가능. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Border")
+	bool bBorderWall = true;
+
+	/** 외곽 성벽 높이(cm). 내부 벽(WallHeight=기본 400)보다 훨씬 높게 두어 미로를 '요새'처럼 가둔다(엄청 높게). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Border", meta = (ClampMin = "1.0"))
+	float BorderWallHeight = 4000.f;
+
+	/** 외곽 성벽 두께(cm). 두껍게 두어 웅장한 테두리 느낌. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Border", meta = (ClampMin = "1.0"))
+	float BorderWallThickness = 300.f;
+
+	/** 미로 바깥 가장자리와 성벽 안쪽 면 사이 여백(cm). 0=미로 외벽에 바짝 붙임. 크게 하면 성벽이 더 멀리 물러난다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Border", meta = (ClampMin = "0.0"))
+	float BorderWallMargin = 0.f;
+
+	/** 외곽 성벽 머티리얼(선택). 미지정 시 원거리 벽 머티리얼(FarWallMaterial)→메시 기본 순으로 폴백. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Border")
+	TObjectPtr<UMaterialInterface> BorderWallMaterial;
+
 	/** 벽에 사용할 스태틱 메시. 기본은 엔진 큐브, 나중에 Fab 벽 메시로 교체 가능. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze")
 	TObjectPtr<UStaticMesh> WallStaticMesh;
@@ -77,9 +100,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze")
 	float WallMeshYawOffset = 0.f;
 
-	/** 플레이어 중심으로 이 반경(셀) 안의 벽만 렌더한다. 대형 미로에서 렌더 메모리를 일정하게 유지. */
+	/** 플레이어 중심으로 이 반경(셀) 안의 근거리 벽(충돌·풀 머티리얼)만 렌더한다. 대형 미로에서 렌더 메모리를 일정하게 유지.
+	 *  일반 모드에선 이 반경 밖을 원거리 HISM(bAutoFarCull로 이 반경 근처까지만)과 안개(bAutoFogFromRenderDistance)가 덮어
+	 *  하드 컷이 안개 뒤에 숨는다 → 작게 잡을수록 렌더 비용↓이고 컷도 안 보인다. (시프트 모드는 전체 렌더라 이 값을 안 씀.) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "1"))
-	int32 RenderRadiusCells = 40;
+	int32 RenderRadiusCells = 18;
 
 	/** 플레이어 위치를 점검해 렌더 윈도우를 갱신하는 주기(초). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze", meta = (ClampMin = "0.02"))
@@ -120,9 +145,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start")
 	bool bTeleportPlayerToStart = true;
 
-	/** 시작 전망대(단상) 높이(cm). WallHeight보다 높으면 벽 너머로 미로 전경이 내려다보인다. 0이면 평지 시작(단상/경사로 없음). */
+	/** 시작 전망대(단상) 높이(cm). >0이면 단상+경사로가 생겨 벽 너머 미로 전경이 내려다보인다.
+	 *  0이면 전망대 없이 평지 시작(마당 중앙 스폰) — 기본값. 밀폐 시작 구역엔 전망대가 없는 게 자연스럽다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start", meta = (ClampMin = "0.0"))
-	float StartPlatformHeight = 520.f;
+	float StartPlatformHeight = 0.f;
+
+	/** 시작 구역(마당)을 입구 쪽으로 늘리는 추가 길이(cm). 클수록 시작 지점과 미로 사이가 멀어진다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start", meta = (ClampMin = "0.0"))
+	float StartCorridorLength = 1500.f;
+
+	/** 켜면 시작 구역 '전체'를 천장+좌우 측벽+뒷벽으로 덮어 완전 밀폐한다(위/옆/뒤로 하늘·곡면 노출 차단, 미로 진입 전 시야 격리). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start")
+	bool bStartCorridorRoof = true;
+
+	/** 시작 구역 밀폐 천장 높이(cm, 바닥 기준). 벽 높이쯤이 자연스럽다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Start", meta = (ClampMin = "50.0"))
+	float StartCorridorHeight = 400.f;
 
 	// --- 피날레(클리어 후 탈출극) ---
 
@@ -204,13 +242,25 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
 	float FreezeRadius = 250.f;
 
-	/** 경로상 플레이어 앞 이 칸 수까지의 닫힌 경로 간선을 (어둠 속이면) 연다. 클수록 더 멀리 앞서 길이 열림. */
+	/** 경로상 플레이어 앞 이 칸 수까지의 닫힌 경로 간선을 (어둠 속이면) 연다. 클수록 더 멀리 앞서 길이 열림.
+	 *  ShiftInnerRadius(근접 무변화 반경) 밖에도 시프트 밴드가 남도록 이 값을 반경보다 넉넉히 크게 둔다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
-	int32 ShiftForwardCells = 4;
+	int32 ShiftForwardCells = 16;
 
 	/** 경로상 플레이어 뒤 이 칸 수까지의 경로 셀에서, 비경로 옆 간선을 (어둠 속이면) 닫는다(백트래킹 봉인). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "1"))
-	int32 ShiftBackCells = 3;
+	int32 ShiftBackCells = 12;
+
+	/** 플레이어 이 반경(cm) 안의 벽은 시프트 대상에서 제외 → '멀리 있는 벽만' 재배열된다(근처는 항상 고정).
+	 *  FreezeRadius(끼임 방지, 작게)와 별개의 '근접 안정 구역'. 크게 잡을수록 더 멀리서만 바뀐다.
+	 *  단, 이 반경이 ShiftForwardCells·ShiftBackCells(셀×CellSize)를 넘으면 후보가 없어 시프트가 멈추니 함께 키운다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
+	float ShiftInnerRadius = 1100.f;
+
+	/** 켜면 시프트 척추 경로를 '가장 가까운 미해결 퍼즐'로 동적 재조준한다(풀면 다음 퍼즐 → 다 풀면 목표=키 꽂는 곳).
+	 *  끄면 시작 시 정한 목표 셀로만 인도(기존 동작). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
+	bool bShiftGuideToPuzzles = true;
 
 	/** 켜면 시프트 후보 벽(얼림/열기후보/닫기후보)과 원뿔을 디버그 드로로 표시(개발용, 기본 꺼짐). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift")
@@ -223,6 +273,14 @@ public:
 	/** 손전등 밝기. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
 	float FlashlightIntensity = 5000.f;
+
+	/** 시프트 모드 벽 렌더 거리(cm). 이 거리 너머 벽 인스턴스는 '렌더만' 생략한다(WallISM 거리 컬링) → Draw/GPU 비용↓.
+	 *  ★인스턴스/인덱스는 그대로라 개폐 애니·피날레 불변식에 영향 없음(윈도우화가 아님). 0=컬링 없음(전체 렌더).
+	 *  ★★반드시 CurveStartDist(월드 커브 시작 거리, 기본 8000)보다 넉넉히 크게 둘 것 — 그보다 작으면 휘어지는 구간이
+	 *  통째로 컬링돼 커브가 안 보인다. 등방성(3D 반경) 컬링이라 '휘어 올라간 먼 벽'과 '평평한 먼 벽'을 방향으로 구분하진 못한다
+	 *  (같은 반경이면 둘 다 잘림). 크게=커브 잘 보임/무거움, 작게=가벼움/커브 잘림. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Shift", meta = (ClampMin = "0.0"))
+	float ShiftRenderDistance = 20000.f;
 
 	// --- 월드 커브(인셉션식 곡면) — 멀리 있는 벽/랜드마크가 위로 휘어 보여 방향감을 준다(시각만, 충돌 무관) ---
 
@@ -251,6 +309,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	TSubclassOf<AActor> GoalBeaconClass;
 
+	/** 켜면 시프트 모드에서 각 퍼즐 방에도 발광 비콘 기둥을 세운다(어둠 속 멀리서 커브로 휘어 보이는 퍼즐 위치 표시). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	bool bSpawnPuzzleBeacons = true;
+
+	/** 퍼즐 비콘으로 스폰할 액터 클래스(키 큰 emissive 메시). 미지정 시 GoalBeaconClass로 폴백. 해결된 퍼즐 비콘은 숨겨진다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
+	TSubclassOf<AActor> PuzzleBeaconClass;
+
 	// --- 휘는 바닥(시프트 모드) — 레벨 평면 바닥은 정점 4개라 WPO로 안 휘므로, 셀 단위 타일 ISM으로 깔아 같은 커브 머티리얼 적용 ---
 
 	/** 켜면 시프트 모드에서 셀마다 바닥 타일(ISM)을 깔아 벽과 같은 커브 머티리얼로 휘게 한다(멀리 타일일수록 들려 곡면 근사). */
@@ -270,15 +336,27 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Curve")
 	TObjectPtr<AActor> FloorActorToHide;
 
-	// --- 시프트 안개 — ExponentialHeightFog를 코드로 스폰해 '천장(위쪽 빈 공간)'과 'X방향 먼 거리'를 함께 정리 ---
+	// --- 거리 안개 — ExponentialHeightFog를 코드로 스폰해 '천장(위쪽 빈 공간)'과 'X방향 먼 거리'를 함께 정리 ---
 
-	/** 켜면 시프트 시작 시 ExponentialHeightFog를 코드로 스폰한다. 천장 부재(하늘)와 수평 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다. */
+	/** 켜면 시프트 모드 시작 시 ExponentialHeightFog를 코드로 스폰/조정한다. 천장 부재(하늘)와 수평 먼 벽을 안개로 덮어 시야를 손전등 반경으로 가둔다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
 	bool bShiftFog = true;
 
-	/** 안개 밀도. 클수록 짙어 가까이서 페이드. */
+	/** 켜면 일반 모드에서도 같은 거리 안개를 스폰한다. bAutoFogFromRenderDistance와 짝을 이뤄, 줄인 렌더 거리 경계를 안개로 가려 자연스럽게 만든다.
+	 *  일반 모드가 안개 없는 밝은 미로여야 한다면 끈다(레벨에 이미 있는 ExponentialHeightFog 파라미터를 덮어쓰지 않게 됨). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
+	bool bNormalFog = true;
+
+	/** 켜면 일반 모드 안개의 시작거리·밀도를 '실제 벽 렌더 거리'(원거리 컷 또는 RenderRadiusCells)에서 자동 산출한다 →
+	 *  렌더 거리를 줄이면 안개가 그만큼 앞당겨 짙어져 컷 경계를 항상 가린다(FogStartDistance·FogDensity는 무시). 끄면 아래 수동값 사용. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
+	bool bAutoFogFromRenderDistance = true;
+
+	/** 안개 밀도(수동값). bAutoFogFromRenderDistance가 꺼졌을 때(및 시프트 모드에서) 사용. 클수록 짙어 가까이서 페이드.
+	 *  시프트 모드: 크게 잡을수록 먼 벽이 '실루엣'으로만 읽힌다(먼 배경=균일한 FogColor, 그 앞 검은 벽=어두운 윤곽).
+	 *  ★단 너무 크면 커브(CurveStartDist=80m+)까지 완전 불투명이 돼 실루엣이 아니라 아예 사라진다 — 커브가 남는 선까지만. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
-	float FogDensity = 0.05f;
+	float FogDensity = 0.12f;
 
 	/** 높이 감쇠. 작을수록 위쪽(천장 방향)까지 안개가 고르게 차올라 천장 부재를 가린다(천장 정리엔 0.01 이하 권장). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
@@ -288,9 +366,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
 	float FogStartDistance = 600.f;
 
-	/** 안개 색(어둠 분위기). 천장/먼 거리가 이 색으로 채워진다. 너무 어두우면(거의 검정) 어두운 씬에서 안 보이니 식별 가능한 회색 권장. */
+	/** 안개 색(=inscattering, self-lit). 천장/먼 거리가 이 색으로 채워지며 **씬 조명과 무관하게 스스로 빛난다** →
+	 *  이 값이 곧 안개의 밝기다(조명 lux를 낮춰도 이건 안 어두워짐). '어둡고 안개낀' 분위기엔 검정에 가깝게(≈0.02).
+	 *  단 너무 검으면 안개 자체가 안 보이고(먼 벽이 그냥 어둠에 잠김), 시프트 실루엣 대비도 약해진다 — 취향껏 미세조정. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
-	FLinearColor FogColor = FLinearColor(0.08f, 0.08f, 0.10f, 1.f);
+	FLinearColor FogColor = FLinearColor(0.012f, 0.012f, 0.016f, 1.f);
 
 	/** 안개 최대 불투명도(1=완전히 가림). 천장(무한 거리 하늘)을 확실히 덮으려면 1 권장. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -300,17 +380,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
 	bool bCeilingFog = true;
 
-	/** 천장(2차) 안개 밀도. 주 안개(FogDensity)보다 크게 잡아 위쪽을 확실히 덮는다. */
+	/** 천장(2차) 안개 밀도. 주 안개(FogDensity)보다 크게 잡아 위쪽을 확실히 덮는다.
+	 *  ★월드 커브로 '위로 말려 올라간 먼 벽/렌더 컷'을 가리는 핵심 레버 — 크게 할수록 휘어지는 쪽이 짙게 덮인다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
-	float CeilingFogDensity = 0.1f;
+	float CeilingFogDensity = 0.3f;
 
 	/** 천장 안개 레이어의 높이 오프셋(cm, 주 안개 기준 높이에서 위로). 벽 높이 위쯤에 두면 벽 너머 위가 덮인다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog")
 	float CeilingFogHeightOffset = 600.f;
 
-	/** 천장 안개의 상방 감쇠. 주 안개(0.005)보다 크게 → 천장 부근에 집중되고 위로 갈수록 얇아진다. */
+	/** 천장 안개의 상방 감쇠. 작을수록 위로 더 높이 차오른다 → 커브로 높이 말려 올라간 먼 벽까지 덮으려면 작게. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|Fog", meta = (ClampMin = "0.0"))
-	float CeilingFogHeightFalloff = 0.02f;
+	float CeilingFogHeightFalloff = 0.01f;
 
 	// --- 원거리 필드(Far Field) — 렌더 윈도우 밖을 '값싼 벽/바닥'으로 채워 하드 컷 없이 먼 거리까지 보이게 ---
 
@@ -333,9 +414,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField", meta = (ClampMin = "0.5", ClampMax = "1.0"))
 	float FarWallShrink = 0.97f;
 
-	/** 원거리 벽 컬링 거리(cm). 0=무제한(안개가 가릴 때). >0이면 그 너머 인스턴스는 렌더 제외. */
+	/** 원거리 벽 컬링 거리(cm). 0이면 bAutoFarCull에 위임(자동/무제한). >0이면 그 너머 인스턴스는 렌더 제외(수동 지정). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField", meta = (ClampMin = "0.0"))
 	float FarCullDistance = 0.f;
+
+	/** 켜면 FarCullDistance가 0일 때 원거리 벽을 RenderRadiusCells 근처(≈1.15배)에서 자동 컷한다 → 근거리 윈도우를 줄이면 원거리도 함께 줄어 안개 뒤에서 끊긴다.
+	 *  끄고 FarCullDistance=0이면 예전처럼 미로 전체(무제한)를 렌더한다. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField")
+	bool bAutoFarCull = true;
 
 	/** 켜면 시프트 모드에서 근거리 바닥 창 밖을 굵은 슈퍼타일 바닥(충돌/그림자 없음)으로 채운다. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Maze|FarField")
@@ -396,6 +482,11 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
 	TObjectPtr<UInstancedStaticMeshComponent> FarFloorISM;
 
+	/** 외곽 성벽(테두리) 인스턴싱용 ISM — 엔진 큐브 몇 개로 미로 둘레 링 구성. 충돌 O(못 넘어감).
+	 *  애니 없음 → 인덱스 안정성 불필요. BuildBorderWall이 1회 채우고 ClearMaze는 건드리지 않는다(창 갱신에 유지). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UInstancedStaticMeshComponent> BorderWallISM;
+
 	/** 시작 구역 마당 바닥 슬래브(미로 서쪽 밖, 레벨 바닥 범위에 의존하지 않는 자기완결 지면). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
 	TObjectPtr<UStaticMeshComponent> StartGround;
@@ -407,6 +498,22 @@ protected:
 	/** 전망대에서 마당 바닥으로 내려가는 경사로(내려와 +X로 걸으면 미로 입구). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
 	TObjectPtr<UStaticMeshComponent> StartRamp;
+
+	/** 시작 통로 터널 천장(입구 앞 구간을 덮어 위쪽 하늘/곡면을 가림). bStartCorridorRoof일 때만 표시. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartCeiling;
+
+	/** 시작 통로 터널 좌측벽(옆으로 하늘을 가림). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartCorridorWallLeft;
+
+	/** 시작 통로 터널 우측벽. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartCorridorWallRight;
+
+	/** 시작 구역 뒷벽(서쪽 끝을 막아 뒤로도 하늘이 안 보이게 완전 밀폐). */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Maze")
+	TObjectPtr<UStaticMeshComponent> StartCorridorBackWall;
 
 private:
 	/** 셀별 벽 비트마스크 저장 (크기 = GridWidth * GridHeight). */
@@ -435,6 +542,10 @@ private:
 	/** 미로 서쪽 밖에 시작 구역(마당 슬래브+전망대 단상+경사로)을 배치·표시한다(런타임, bStartZone일 때). */
 	void BuildStartZone();
 
+	/** 미로 바깥 둘레에 큰 외곽 성벽(테두리)을 1회 세운다(엔진 큐브 4~5개 박스 링, 서쪽 입구만 트임).
+	 *  BeginPlay에서 GenerateMaze 뒤 1회 — ClearMaze가 지우지 않으므로 창 갱신에도 유지. 런타임 전용. */
+	void BuildBorderWall();
+
 	/** 플레이어를 전망대 위(단상 없으면 마당 중앙)로 순간이동 + 반대편 코너를 향해 시선 고정.
 	 *  폰 소유가 액터 BeginPlay보다 늦을 수 있어 다음 틱 타이머로 재시도한다. */
 	void PlacePlayerAtStart();
@@ -458,6 +569,10 @@ private:
 	/** 미로 전체의 벽을 원거리 레이어(FarWallISM)로 1회 빌드. 일직선 연속 벽은 FarMergeMaxRunCells까지 병합.
 	 *  Cells의 순수 함수(RNG 없음) — 결정론 자동. 근거리 벽보다 FarWallShrink만큼 작아 안쪽에 숨는다. */
 	void BuildFarWalls();
+
+	/** 일반 모드 '실제 벽 렌더 거리'(cm) = 원거리 벽이 컬링되는 거리. FarCullDistance>0이면 그 값,
+	 *  아니면 bAutoFarCull일 때 RenderRadiusCells 근처(≈1.15배), 둘 다 아니면 0(무제한). 원거리 컷과 자동 안개가 공유. */
+	float GetEffectiveFarCullDistance() const;
 
 	/** 미로 전체를 FarFloorTileCells 간격 슈퍼타일 바닥으로 1회 빌드(시프트 모드). 상판 z=-2cm로 근거리 바닥 아래. */
 	void BuildFarFloor();
@@ -674,6 +789,30 @@ private:
 	/** 시프트 경로(플레이어 시작→목표) + 렌더가 준비되어 Tick이 개폐 애니를 구동하는 상태. */
 	bool bShiftActive = false;
 
+	// --- 시프트 퍼즐 인도(동적 재타겟팅) 상태 ---
+
+	/** 배치된 퍼즐들의 방 중심 셀(DistributeRoomActors가 채움). ShiftPuzzles와 병렬. */
+	TArray<FIntPoint> ShiftPuzzleCells;
+
+	/** 배치된 퍼즐 액터(해결 상태 폴링용). ShiftPuzzleCells와 병렬. */
+	TArray<TWeakObjectPtr<ASlidingTilePuzzle>> ShiftPuzzles;
+
+	/** 퍼즐 셀마다 세운 발광 비콘(해결되면 숨김). ShiftPuzzleCells와 병렬. */
+	TArray<TWeakObjectPtr<AActor>> ShiftPuzzleBeacons;
+
+	/** 모든 퍼즐 해결 후의 최종 도착점 = 목표 방(키 꽂는 곳) 중심 셀. */
+	FIntPoint ShiftFinalGoalCell = FIntPoint(0, 0);
+
+	/** 현재 척추가 향하는 도착점(변화 감지용 — 바뀌면 경로 재빌드). */
+	FIntPoint ShiftCurrentTarget = FIntPoint(MIN_int32, MIN_int32);
+
+	/** 현재 플레이어 셀 → Goal까지 단조 staircase 경로(RouteCells/RouteEdgeSet)를 재구성. 진행 중 애니는 보존.
+	 *  InitShiftRun(첫 회)과 UpdateShiftTarget(재타겟팅)이 공유. */
+	void BuildRouteTo(FIntPoint Goal);
+
+	/** 매 사이클: 가장 가까운 미해결 퍼즐(없으면 목표)로 척추를 재조준하고, 해결된 퍼즐 비콘을 숨긴다. */
+	void UpdateShiftTarget(const FVector& PlayerLoc);
+
 	/** 첫 ShiftTick에서 1회: 플레이어 시작→목표 staircase 경로(RouteCells/RouteEdgeSet) 산출 + Tick 활성. */
 	void InitShiftRun();
 
@@ -683,8 +822,9 @@ private:
 	/** 시프트 모드: 플레이어 카메라에 손전등(스포트라이트)을 코드로 1회 부착(관측 파라미터와 원뿔/사거리 일치). */
 	void EnsureShiftFlashlight(APawn* Pawn);
 
-	/** 시프트 모드: ExponentialHeightFog를 코드로 1회 스폰(천장 부재 + X방향 먼 벽을 안개로 정리). */
-	void EnsureShiftFog();
+	/** ExponentialHeightFog를 코드로 1회 스폰/조정(천장 부재 + 먼 벽을 안개로 정리). 시프트=손전등 반경 안개,
+	 *  일반=bAutoFogFromRenderDistance면 렌더 거리에 맞춰 시작거리·밀도 자동 산출. 모드별 게이트(bShiftFog/bNormalFog). */
+	void EnsureFog();
 
 	/** 어떤 경우에도 플레이어→목표 길을 보장: 단절 시 어둠 우선 최소-벽 경로(Dijkstra)를 찾아 즉시 개통. 연 벽 수 반환. */
 	int32 RepairConnectivityToGoal(FIntPoint PlayerCell, const FVector& CamLoc, const FVector& CamFwd);

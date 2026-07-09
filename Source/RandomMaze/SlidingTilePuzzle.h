@@ -43,6 +43,9 @@ public:
 
 	virtual void Tick(float DeltaSeconds) override;
 
+	/** 완성(보상 연출 시작 포함)됐는지 — 외부(미로 시프트 인도)가 해결 상태를 폴링하는 데 사용. */
+	bool HasBeenSolved() const { return SolvePhase != ESolvePhase::None; }
+
 	// --- 퍼즐 파라미터 (디테일 패널) ---
 
 	/** 격자 한 변의 타일 수(N). 8타일=3, 15타일=4. */
